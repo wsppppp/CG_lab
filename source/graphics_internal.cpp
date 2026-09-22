@@ -705,8 +705,8 @@ FrameData prepare() {
 
 retry_acquire:
 	switch (vkAcquireNextImageKHR(context.device, vk_swapchain, UINT64_MAX,
-								  vk_semaphore_image_available, VK_NULL_HANDLE,
-								  &vk_swapchain_current_image)) {
+		vk_semaphore_image_available, VK_NULL_HANDLE,
+		&vk_swapchain_current_image)) {
 	case VK_SUCCESS:
 		break;
 
@@ -725,10 +725,42 @@ retry_acquire:
 
 	vkResetFences(context.device, 1, &vk_fence_frame_in_flight);
 
+	// === Õ¿◊»Õ¿≈Ã «¿œ»—‹ COMMAND BUFFER ===
+	vkResetCommandBuffer(vk_command_buffer, 0);
+
+	const VkCommandBufferBeginInfo begin_info = {
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vkBeginCommandBuffer(vk_command_buffer, &begin_info);
+
+	// === Œ“ –€¬¿≈Ã RENDER PASS ===
+	const VkClearValue clear_values[] = {
+		{.color = { { 0.1f, 0.1f, 0.15f, 1.0f } } },   // ˆ‚ÂÚ ÙÓÌ‡
+		{.depthStencil = { 1.0f, 0 } },                 // depth
+	};
+
+	const VkRenderPassBeginInfo render_pass_begin = {
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.renderPass = context.render_pass,
+		.framebuffer = vk_framebuffers[vk_swapchain_current_image],
+		.renderArea = {.extent = context.swapchain_extent },
+		.clearValueCount = 2,
+		.pClearValues = clear_values,
+	};
+
+	vkCmdBeginRenderPass(vk_command_buffer, &render_pass_begin, VK_SUBPASS_CONTENTS_INLINE);
+
 	return {
 		.framebuffer = vk_framebuffers[vk_swapchain_current_image],
 		.command_buffer = vk_command_buffer,
 	};
+}
+
+// === ÕŒ¬¿ﬂ ‘”Õ ÷»ﬂ: Á‡Í˚Ú¸ render pass Ë command buffer ===
+void finish() {
+	vkCmdEndRenderPass(vk_command_buffer);
+	vkEndCommandBuffer(vk_command_buffer);
 }
 
 void submitAndPresent() {

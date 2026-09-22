@@ -1,23 +1,73 @@
 cmake_minimum_required(VERSION 3.20)
+
 include(FetchContent)
 
 project(vulkan-starter-app LANGUAGES C CXX)
 
-add_executable(${PROJECT_NAME} source/main.cpp source/graphics_internal.cpp source/application.cpp)
+add_executable(
+	${PROJECT_NAME}
+	source/main.cpp
+	source/graphics_internal.cpp
+	source/application.cpp
+)
 
 if(LINUX)
-	target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+	target_compile_options(
+		${PROJECT_NAME}
+		PRIVATE
+		-Wall
+		-Wextra
+		-Wno-missing-field-initializers
+	)
+
 elseif(APPLE)
-	target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wno-missing-field-initializers)
+	target_compile_options(
+		${PROJECT_NAME}
+		PRIVATE
+		-Wall
+		-Wextra
+		-Wno-missing-field-initializers
+	)
+
 elseif(MSVC)
-	target_compile_options(${PROJECT_NAME} PRIVATE /W4 /wd4201)
-	target_link_options(${PROJECT_NAME} PRIVATE /subsystem:windows /entry:mainCRTStartup)
-	target_compile_definitions(${PROJECT_NAME} PRIVATE -D_USE_MATH_DEFINES)
+	target_compile_options(
+		${PROJECT_NAME}
+		PRIVATE
+		/W4
+		/wd4201
+	)
+
+	target_link_options(
+		${PROJECT_NAME}
+		PRIVATE
+		/subsystem:windows
+		/entry:mainCRTStartup
+	)
+
+	target_compile_definitions(
+		${PROJECT_NAME}
+		PRIVATE
+		-D_USE_MATH_DEFINES
+	)
+
 else()
-	message(FATAL_ERROR "${CMAKE_SYSTEM_NAME} is not supported")
+	message(
+		FATAL_ERROR
+		"${CMAKE_SYSTEM_NAME} is not supported"
+	)
+
 endif()
 
-set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD_REQUIRED TRUE CXX_STANDARD 20)
+set_target_properties(
+	${PROJECT_NAME}
+	PROPERTIES
+	CXX_STANDARD 20
+	CXX_STANDARD_REQUIRED TRUE
+)
+
+# ============================================================
+# Dependencies
+# ============================================================
 
 FetchContent_Declare(
 	glfw
@@ -57,17 +107,37 @@ FetchContent_MakeAvailable(
 	imgui
 )
 
-target_link_libraries(${PROJECT_NAME} PRIVATE
+# ============================================================
+# Libraries
+# ============================================================
+
+target_link_libraries(
+	${PROJECT_NAME}
+	PRIVATE
 	glfw
 	Vulkan::Vulkan
 	vk-bootstrap::vk-bootstrap
 	GPUOpen::VulkanMemoryAllocator
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
-target_sources(${PROJECT_NAME} PRIVATE
+# ============================================================
+# ImGUI
+# ============================================================
+
+target_include_directories(
+	${PROJECT_NAME}
+	PRIVATE
+	${imgui_SOURCE_DIR}
+	${imgui_SOURCE_DIR}/backends
+)
+
+target_sources(
+	${PROJECT_NAME}
+	PRIVATE
+
 	${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
 	${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+
 	${imgui_SOURCE_DIR}/imgui.cpp
 	${imgui_SOURCE_DIR}/imgui_draw.cpp
 	${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -75,32 +145,88 @@ target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/imgui_demo.cpp
 )
 
-# Compile shaders
-find_program(GLSLC_FOUND glslc)
-if(GLSLC_FOUND)
-	set(_SHADER_BINARIES)
+# ============================================================
+# Shader directory
+# ============================================================
 
-	macro(compile_shader SHADER_FILE)
-		set(SHADER_SOURCE ${CMAKE_SOURCE_DIR}/shaders/${SHADER_FILE})
-		set(SHADER_BINARY ${SHADER_FILE}.spv)
-		set(SHADER_BINARY_PATH ${CMAKE_SOURCE_DIR}/shaders/${SHADER_BINARY})
+target_compile_definitions(
+	${PROJECT_NAME}
+	PRIVATE
+	SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders"
+)
 
-		add_custom_command(
-			OUTPUT ${SHADER_BINARY_PATH}
-			COMMAND glslc ${SHADER_SOURCE} -o ${SHADER_BINARY_PATH}
-			DEPENDS ${SHADER_SOURCE}
-			COMMENT "Compiling ${SHADER_FILE} shader"
-		)
+# ============================================================
+# GLSL -> SPIR-V
+# ============================================================
 
-		list(APPEND _SHADER_BINARIES ${SHADER_BINARY_PATH})
-	endmacro()
+find_program(
+	GLSLC_FOUND
+	glslc
+)
 
-	# To compile shader file, use compile_shader function with a file name
-	# of a shader inside shaders directory. See example below:
-
-	# compile_shader(example.vert)
-	# compile_shader(example.frag)
-
-	add_custom_target(shaders DEPENDS ${_SHADER_BINARIES})
-	add_dependencies(${PROJECT_NAME} shaders)
+if(NOT GLSLC_FOUND)
+	message(
+		FATAL_ERROR
+		"glslc was not found in PATH. Install Vulkan SDK or add glslc to PATH."
+	)
 endif()
+
+set(_SHADER_BINARIES)
+
+macro(compile_shader SHADER_FILE)
+
+	set(
+		SHADER_SOURCE
+		${CMAKE_SOURCE_DIR}/shaders/${SHADER_FILE}
+	)
+
+	set(
+		SHADER_BINARY
+		${SHADER_FILE}.spv
+	)
+
+	set(
+		SHADER_BINARY_PATH
+		${CMAKE_SOURCE_DIR}/shaders/${SHADER_BINARY}
+	)
+
+	add_custom_command(
+		OUTPUT ${SHADER_BINARY_PATH}
+
+		COMMAND
+			glslc
+			${SHADER_SOURCE}
+			-o
+			${SHADER_BINARY_PATH}
+
+		DEPENDS
+			${SHADER_SOURCE}
+
+		COMMENT
+			"Compiling ${SHADER_FILE} shader"
+	)
+
+	list(
+		APPEND
+		_SHADER_BINARIES
+		${SHADER_BINARY_PATH}
+	)
+
+endmacro()
+
+# IMPORTANT:
+# These two calls were missing in the original CMakeLists.txt.
+
+compile_shader(basic.vert)
+compile_shader(basic.frag)
+
+add_custom_target(
+	shaders
+	DEPENDS
+		${_SHADER_BINARIES}
+)
+
+add_dependencies(
+	${PROJECT_NAME}
+	shaders
+)

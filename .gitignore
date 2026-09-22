@@ -1,3 +1,6 @@
 build-*/
 shaders/*.spv
 imgui.ini
+.vs/
+build/
+cmake-build-debug/
