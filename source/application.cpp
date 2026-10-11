@@ -2,1436 +2,1599 @@
 
 #include <imgui.h>
 
-#include <vulkan/vulkan.h>
-#include <vk_mem_alloc.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace application {
-
-	namespace {
-
-		// ============================================================
-		// Math
-		// ============================================================
-
-		constexpr float PI = 3.14159265358979323846f;
-
-		struct Vec3 {
-			float x;
-			float y;
-			float z;
-		};
-
-		struct Mat4 {
-			float m[16]{};
-
-			float& at(int row, int column) {
-				return m[column * 4 + row];
-			}
-
-			const float& at(int row, int column) const {
-				return m[column * 4 + row];
-			}
-		};
-
-		Mat4 identity() {
-			Mat4 result{};
-
-			result.at(0, 0) = 1.0f;
-			result.at(1, 1) = 1.0f;
-			result.at(2, 2) = 1.0f;
-			result.at(3, 3) = 1.0f;
-
-			return result;
-		}
-
-		Mat4 multiply(const Mat4& a, const Mat4& b) {
-			Mat4 result{};
-
-			for (int row = 0; row < 4; ++row) {
-				for (int column = 0; column < 4; ++column) {
-					float value = 0.0f;
-
-					for (int k = 0; k < 4; ++k) {
-						value += a.at(row, k) * b.at(k, column);
-					}
-
-					result.at(row, column) = value;
-				}
-			}
-
-			return result;
-		}
-
-		Mat4 translation(float x, float y, float z) {
-			Mat4 result = identity();
-
-			result.at(0, 3) = x;
-			result.at(1, 3) = y;
-			result.at(2, 3) = z;
-
-			return result;
-		}
-
-		Mat4 scale(float x, float y, float z) {
-			Mat4 result{};
-
-			result.at(0, 0) = x;
-			result.at(1, 1) = y;
-			result.at(2, 2) = z;
-			result.at(3, 3) = 1.0f;
-
-			return result;
-		}
-
-		Mat4 rotationX(float angle) {
-			const float c = std::cos(angle);
-			const float s = std::sin(angle);
-
-			Mat4 result = identity();
-
-			result.at(1, 1) = c;
-			result.at(1, 2) = -s;
-			result.at(2, 1) = s;
-			result.at(2, 2) = c;
-
-			return result;
-		}
-
-		Mat4 rotationY(float angle) {
-			const float c = std::cos(angle);
-			const float s = std::sin(angle);
-
-			Mat4 result = identity();
-
-			result.at(0, 0) = c;
-			result.at(0, 2) = s;
-			result.at(2, 0) = -s;
-			result.at(2, 2) = c;
-
-			return result;
-		}
-
-		Mat4 rotationZ(float angle) {
-			const float c = std::cos(angle);
-			const float s = std::sin(angle);
-
-			Mat4 result = identity();
-
-			result.at(0, 0) = c;
-			result.at(0, 1) = -s;
-			result.at(1, 0) = s;
-			result.at(1, 1) = c;
-
-			return result;
-		}
-
-		// Vulkan perspective projection.
-		// Camera looks along -Z.
-		// Z range is [0, 1], as required by Vulkan.
-		Mat4 perspective(float fovRadians, float aspect, float nearPlane, float farPlane) {
-			const float f = 1.0f / std::tan(fovRadians * 0.5f);
-
-			Mat4 result{};
-
-			result.at(0, 0) = f / aspect;
-
-			// Vulkan Y flip.
-			result.at(1, 1) = -f;
-
-			result.at(2, 2) = farPlane / (nearPlane - farPlane);
-			result.at(2, 3) = (farPlane * nearPlane) / (nearPlane - farPlane);
-			result.at(3, 2) = -1.0f;
-
-			return result;
-		}
-
-		Mat4 orthographic(
-			float left,
-			float right,
-			float bottom,
-			float top,
-			float nearPlane,
-			float farPlane) {
-
-			Mat4 result = identity();
-
-			result.at(0, 0) = 2.0f / (right - left);
-			result.at(1, 1) = -2.0f / (top - bottom);
-
-			result.at(2, 2) = 1.0f / (nearPlane - farPlane);
-
-			result.at(0, 3) = -(right + left) / (right - left);
-			result.at(1, 3) = -(top + bottom) / (top - bottom);
-			result.at(2, 3) = nearPlane / (nearPlane - farPlane);
-
-			return result;
-		}
-
-		float radians(float degrees) {
-			return degrees * PI / 180.0f;
-		}
-
-		// ============================================================
-		// Dodecahedron
-		// ============================================================
-
-		struct Vertex {
-			float position[3];
-		};
-
-		// Regular dodecahedron:
-		//
-		// (±1, ±1, ±1)
-		// (0, ±1/phi, ±phi)
-		// (±1/phi, ±phi, 0)
-		// (±phi, 0, ±1/phi)
-		//
-		// phi = (1 + sqrt(5)) / 2
-		//
-		constexpr float PHI = 1.6180339887498948482f;
-		constexpr float INV_PHI = 0.6180339887498948482f;
-
-		const std::array<Vertex, 20> g_vertices = { {
-			{{-1.0f, -1.0f, -1.0f}},
-			{{-1.0f, -1.0f,  1.0f}},
-			{{-1.0f,  1.0f, -1.0f}},
-			{{-1.0f,  1.0f,  1.0f}},
-			{{ 1.0f, -1.0f, -1.0f}},
-			{{ 1.0f, -1.0f,  1.0f}},
-			{{ 1.0f,  1.0f, -1.0f}},
-			{{ 1.0f,  1.0f,  1.0f}},
-
-			{{ 0.0f, -INV_PHI, -PHI}},
-			{{ 0.0f, -INV_PHI,  PHI}},
-			{{ 0.0f,  INV_PHI, -PHI}},
-			{{ 0.0f,  INV_PHI,  PHI}},
-
-			{{-INV_PHI, -PHI, 0.0f}},
-			{{-INV_PHI,  PHI, 0.0f}},
-			{{ INV_PHI, -PHI, 0.0f}},
-			{{ INV_PHI,  PHI, 0.0f}},
-
-			{{-PHI, 0.0f, -INV_PHI}},
-			{{ PHI, 0.0f, -INV_PHI}},
-			{{-PHI, 0.0f,  INV_PHI}},
-			{{ PHI, 0.0f,  INV_PHI}}
-		} };
-
-		// 12 pentagonal faces.
-		// Every pentagon is triangulated as:
-		// (0,1,2), (0,2,3), (0,3,4).
-		//
-		// The order is chosen so that the normals point outward.
-		const std::array<std::array<uint32_t, 5>, 12> g_faces = { {
-			{{18, 16,  0, 12,  1}},
-			{{10,  8,  0, 16,  2}},
-			{{14, 12,  0,  8,  4}},
-			{{ 3, 18,  1,  9, 11}},
-			{{ 5,  9,  1, 12, 14}},
-			{{ 3, 13,  2, 16, 18}},
-			{{ 6, 10,  2, 13, 15}},
-			{{15, 13,  3, 11,  7}},
-			{{ 5, 14,  4, 17, 19}},
-			{{ 6, 17,  4,  8, 10}},
-			{{11,  9,  5, 19,  7}},
-			{{19, 17,  6, 15,  7}}
-		} };
-
-		std::array<uint32_t, 108> createIndices() {
-			std::array<uint32_t, 108> indices{};
-
-			size_t index = 0;
-
-			for (const auto& face : g_faces) {
-				indices[index++] = face[0];
-				indices[index++] = face[1];
-				indices[index++] = face[2];
-
-				indices[index++] = face[0];
-				indices[index++] = face[2];
-				indices[index++] = face[3];
-
-				indices[index++] = face[0];
-				indices[index++] = face[3];
-				indices[index++] = face[4];
-			}
-
-			return indices;
-		}
-
-		// ============================================================
-		// GPU resources
-		// ============================================================
-
-		struct Buffer {
-			VkBuffer buffer = VK_NULL_HANDLE;
-			VmaAllocation allocation = VK_NULL_HANDLE;
-			void* mapped = nullptr;
-			VkDeviceSize size = 0;
-		};
-
-		constexpr uint32_t OBJECT_COUNT = 2;
-
-		struct UniformBufferObject {
-			Mat4 mvp;
-			float color[4];
-		};
-
-		Buffer g_vertexBuffer;
-		Buffer g_indexBuffer;
-		std::array<Buffer, OBJECT_COUNT> g_uniformBuffers;
-
-		VkDescriptorSetLayout g_descriptorSetLayout = VK_NULL_HANDLE;
-		VkDescriptorPool g_descriptorPool = VK_NULL_HANDLE;
-		std::array<VkDescriptorSet, OBJECT_COUNT> g_descriptorSets{};
-
-		VkPipelineLayout g_pipelineLayout = VK_NULL_HANDLE;
-		VkPipeline g_pipeline = VK_NULL_HANDLE;
-
-		uint32_t g_indexCount = 108;
-
-		// ============================================================
-		// ImGUI state
-		// ============================================================
-
-		bool g_perspective = true;
-
-		float g_position[3] = {
-			0.0f,
-			0.0f,
-			0.0f
-		};
-
-		float g_rotation[3] = {
-			0.0f,
-			0.0f,
-			0.0f
-		};
-
-		float g_scale[3] = {
-			1.0f,
-			1.0f,
-			1.0f
-		};
-
-		float g_color[4] = {
-			0.2f,
-			0.65f,
-			1.0f,
-			1.0f
-		};
-
-		bool g_animationEnabled = true;
-		bool g_showSecondObject = true;
-
-		float g_animationSpeed = 1.0f;
-		float g_orbitRadius = 1.5f;
-		float g_orbitHeight = 0.8f;
-		float g_orbitFrequency = 1.0f;
-		float g_rotationSpeed = 45.0f;
-
-		double g_lastTime = 0.0;
-		float g_animationTime = 0.0f;
-
-		// ============================================================
-		// Vulkan helpers
-		// ============================================================
-
-		void destroyBuffer(Buffer& buffer) {
-			auto& context = graphics::internal::context;
-
-			if (buffer.buffer != VK_NULL_HANDLE) {
-				vmaDestroyBuffer(
-					context.allocator,
-					buffer.buffer,
-					buffer.allocation);
-			}
-
-			buffer.buffer = VK_NULL_HANDLE;
-			buffer.allocation = VK_NULL_HANDLE;
-			buffer.mapped = nullptr;
-			buffer.size = 0;
-		}
-
-		bool createBuffer(
-			VkDeviceSize size,
-			VkBufferUsageFlags usage,
-			Buffer& result) {
-
-			auto& context = graphics::internal::context;
-
-			const VkBufferCreateInfo bufferInfo = {
-				.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-				.size = size,
-				.usage = usage,
-				.sharingMode = VK_SHARING_MODE_EXCLUSIVE
-			};
-
-			const VmaAllocationCreateInfo allocationInfo = {
-				.flags =
-					VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-					VMA_ALLOCATION_CREATE_MAPPED_BIT,
-				.usage = VMA_MEMORY_USAGE_AUTO
-			};
-
-			VmaAllocationInfo actualAllocationInfo{};
-
-			const VkResult vkResult = vmaCreateBuffer(
-				context.allocator,
-				&bufferInfo,
-				&allocationInfo,
-				&result.buffer,
-				&result.allocation,
-				&actualAllocationInfo);
-
-			if (vkResult != VK_SUCCESS) {
-				std::cerr << "Failed to create VMA buffer. VkResult = "
-					<< vkResult << '\n';
-
-				return false;
-			}
-
-			result.size = size;
-			result.mapped = actualAllocationInfo.pMappedData;
-
-			return true;
-		}
-
-		bool loadShaderModule(
-			const char* filename,
-			VkShaderModule& shaderModule) {
-
-			std::ifstream file(
-				filename,
-				std::ios::ate | std::ios::binary);
-
-			if (!file.is_open()) {
-				std::cerr << "Failed to open shader: "
-					<< filename << '\n';
-
-				return false;
-			}
-
-			const std::streamsize fileSize = file.tellg();
-
-			if (fileSize <= 0 || fileSize % 4 != 0) {
-				std::cerr << "Invalid SPIR-V file: "
-					<< filename << '\n';
-
-				return false;
-			}
-
-			file.seekg(0);
-
-			std::vector<char> bytes(
-				static_cast<size_t>(fileSize));
-
-			file.read(bytes.data(), fileSize);
-
-			if (!file) {
-				std::cerr << "Failed to read shader: "
-					<< filename << '\n';
-
-				return false;
-			}
-
-			std::vector<uint32_t> code(
-				static_cast<size_t>(fileSize) / sizeof(uint32_t));
-
-			std::memcpy(
-				code.data(),
-				bytes.data(),
-				bytes.size());
-
-			auto& context = graphics::internal::context;
-
-			const VkShaderModuleCreateInfo createInfo = {
-				.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-				.codeSize = code.size() * sizeof(uint32_t),
-				.pCode = code.data()
-			};
-
-			if (vkCreateShaderModule(
-				context.device,
-				&createInfo,
-				nullptr,
-				&shaderModule) != VK_SUCCESS) {
-
-				std::cerr << "Failed to create shader module: "
-					<< filename << '\n';
-
-				return false;
-			}
-
-			return true;
-		}
-
-		// ============================================================
-		// Pipeline
-		// ============================================================
-
-		bool createDescriptorResources() {
-			auto& context = graphics::internal::context;
-
-			const VkDescriptorSetLayoutBinding uboBinding = {
-				.binding = 0,
-				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.descriptorCount = 1,
-				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT
-			};
-
-			const VkDescriptorSetLayoutCreateInfo layoutInfo = {
-				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-				.bindingCount = 1,
-				.pBindings = &uboBinding
-			};
-
-			if (vkCreateDescriptorSetLayout(
-				context.device,
-				&layoutInfo,
-				nullptr,
-				&g_descriptorSetLayout) != VK_SUCCESS) {
-
-				std::cerr << "Failed to create descriptor set layout\n";
-				return false;
-			}
-
-			const VkDescriptorPoolSize poolSize = {
-				.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-				.descriptorCount = OBJECT_COUNT
-			};
-
-			const VkDescriptorPoolCreateInfo poolInfo = {
-				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-				.maxSets = OBJECT_COUNT,
-				.poolSizeCount = 1,
-				.pPoolSizes = &poolSize
-			};
-
-			if (vkCreateDescriptorPool(
-				context.device,
-				&poolInfo,
-				nullptr,
-				&g_descriptorPool) != VK_SUCCESS) {
-
-				std::cerr << "Failed to create descriptor pool\n";
-				return false;
-			}
-
-			std::array<VkDescriptorSetLayout, OBJECT_COUNT> layouts{};
-
-			for (auto& layout : layouts) {
-				layout = g_descriptorSetLayout;
-			}
-
-			const VkDescriptorSetAllocateInfo allocateInfo = {
-				.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-				.descriptorPool = g_descriptorPool,
-				.descriptorSetCount = OBJECT_COUNT,
-				.pSetLayouts = layouts.data()
-			};
-
-			if (vkAllocateDescriptorSets(
-				context.device,
-				&allocateInfo,
-				g_descriptorSets.data()) != VK_SUCCESS) {
-
-				std::cerr << "Failed to allocate descriptor sets\n";
-				return false;
-			}
-
-			for (uint32_t i = 0; i < OBJECT_COUNT; ++i) {
-				const VkDescriptorBufferInfo bufferInfo = {
-					.buffer = g_uniformBuffers[i].buffer,
-					.offset = 0,
-					.range = sizeof(UniformBufferObject)
-				};
-
-				const VkWriteDescriptorSet write = {
-					.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-					.dstSet = g_descriptorSets[i],
-					.dstBinding = 0,
-					.dstArrayElement = 0,
-					.descriptorCount = 1,
-					.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-					.pBufferInfo = &bufferInfo
-				};
-
-				vkUpdateDescriptorSets(
-					context.device,
-					1,
-					&write,
-					0,
-					nullptr);
-			}
-
-			return true;
-		}
-
-		bool createPipeline() {
-			auto& context = graphics::internal::context;
-
-			VkShaderModule vertexShader = VK_NULL_HANDLE;
-			VkShaderModule fragmentShader = VK_NULL_HANDLE;
-
-#ifdef SHADER_DIR
-			const char* vertexShaderPath =
-				SHADER_DIR "/basic.vert.spv";
-
-			const char* fragmentShaderPath =
-				SHADER_DIR "/basic.frag.spv";
-#else
-			const char* vertexShaderPath =
-				"shaders/basic.vert.spv";
-
-			const char* fragmentShaderPath =
-				"shaders/basic.frag.spv";
-#endif
-
-			if (!loadShaderModule(vertexShaderPath, vertexShader)) {
-				return false;
-			}
-
-			if (!loadShaderModule(fragmentShaderPath, fragmentShader)) {
-				vkDestroyShaderModule(
-					context.device,
-					vertexShader,
-					nullptr);
-
-				return false;
-			}
-
-			const VkPipelineShaderStageCreateInfo shaderStages[] = {
-				{
-					.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-					.stage = VK_SHADER_STAGE_VERTEX_BIT,
-					.module = vertexShader,
-					.pName = "main"
-				},
-				{
-					.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-					.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-					.module = fragmentShader,
-					.pName = "main"
-				}
-			};
-
-			const VkVertexInputBindingDescription vertexBinding = {
-				.binding = 0,
-				.stride = sizeof(Vertex),
-				.inputRate = VK_VERTEX_INPUT_RATE_VERTEX
-			};
-
-			const VkVertexInputAttributeDescription vertexAttribute = {
-				.location = 0,
-				.binding = 0,
-				.format = VK_FORMAT_R32G32B32_SFLOAT,
-				.offset = offsetof(Vertex, position)
-			};
-
-			const VkPipelineVertexInputStateCreateInfo vertexInput = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-				.vertexBindingDescriptionCount = 1,
-				.pVertexBindingDescriptions = &vertexBinding,
-				.vertexAttributeDescriptionCount = 1,
-				.pVertexAttributeDescriptions = &vertexAttribute
-			};
-
-			const VkPipelineInputAssemblyStateCreateInfo inputAssembly = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-				.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
-				.primitiveRestartEnable = VK_FALSE
-			};
-
-			const VkPipelineViewportStateCreateInfo viewportState = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-				.viewportCount = 1,
-				.scissorCount = 1
-			};
-
-			const VkPipelineRasterizationStateCreateInfo rasterization = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-				.depthClampEnable = VK_FALSE,
-				.rasterizerDiscardEnable = VK_FALSE,
-				.polygonMode = VK_POLYGON_MODE_FILL,
-				.cullMode = VK_CULL_MODE_BACK_BIT,
-
-				// The projection matrix contains the Vulkan Y flip.
-				// Therefore the winding is inverted in framebuffer space.
-				.frontFace = VK_FRONT_FACE_CLOCKWISE,
-
-				.depthBiasEnable = VK_FALSE,
-				.lineWidth = 1.0f
-			};
-
-			const VkPipelineMultisampleStateCreateInfo multisample = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-				.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT
-			};
-
-			const VkPipelineDepthStencilStateCreateInfo depthStencil = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
-				.depthTestEnable = VK_TRUE,
-				.depthWriteEnable = VK_TRUE,
-				.depthCompareOp = VK_COMPARE_OP_LESS,
-				.depthBoundsTestEnable = VK_FALSE,
-				.stencilTestEnable = VK_FALSE
-			};
-
-			const VkPipelineColorBlendAttachmentState colorBlendAttachment = {
-				.blendEnable = VK_FALSE,
-				.colorWriteMask =
-					VK_COLOR_COMPONENT_R_BIT |
-					VK_COLOR_COMPONENT_G_BIT |
-					VK_COLOR_COMPONENT_B_BIT |
-					VK_COLOR_COMPONENT_A_BIT
-			};
-
-			const VkPipelineColorBlendStateCreateInfo colorBlend = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
-				.logicOpEnable = VK_FALSE,
-				.attachmentCount = 1,
-				.pAttachments = &colorBlendAttachment
-			};
-
-			const VkDynamicState dynamicStates[] = {
-				VK_DYNAMIC_STATE_VIEWPORT,
-				VK_DYNAMIC_STATE_SCISSOR
-			};
-
-			const VkPipelineDynamicStateCreateInfo dynamicState = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-				.dynamicStateCount = 2,
-				.pDynamicStates = dynamicStates
-			};
-
-			const VkPushConstantRange* pushConstants = nullptr;
-
-			const VkPipelineLayoutCreateInfo pipelineLayoutInfo = {
-				.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-				.setLayoutCount = 1,
-				.pSetLayouts = &g_descriptorSetLayout,
-				.pushConstantRangeCount = 0,
-				.pPushConstantRanges = pushConstants
-			};
-
-			if (vkCreatePipelineLayout(
-				context.device,
-				&pipelineLayoutInfo,
-				nullptr,
-				&g_pipelineLayout) != VK_SUCCESS) {
-
-				std::cerr << "Failed to create pipeline layout\n";
-
-				vkDestroyShaderModule(
-					context.device,
-					fragmentShader,
-					nullptr);
-
-				vkDestroyShaderModule(
-					context.device,
-					vertexShader,
-					nullptr);
-
-				return false;
-			}
-
-			const VkGraphicsPipelineCreateInfo pipelineInfo = {
-				.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-				.stageCount = 2,
-				.pStages = shaderStages,
-				.pVertexInputState = &vertexInput,
-				.pInputAssemblyState = &inputAssembly,
-				.pViewportState = &viewportState,
-				.pRasterizationState = &rasterization,
-				.pMultisampleState = &multisample,
-				.pDepthStencilState = &depthStencil,
-				.pColorBlendState = &colorBlend,
-				.pDynamicState = &dynamicState,
-				.layout = g_pipelineLayout,
-				.renderPass = context.render_pass,
-				.subpass = 0
-			};
-
-			if (vkCreateGraphicsPipelines(
-				context.device,
-				VK_NULL_HANDLE,
-				1,
-				&pipelineInfo,
-				nullptr,
-				&g_pipeline) != VK_SUCCESS) {
-
-				std::cerr << "Failed to create graphics pipeline\n";
-
-				vkDestroyPipelineLayout(
-					context.device,
-					g_pipelineLayout,
-					nullptr);
-
-				g_pipelineLayout = VK_NULL_HANDLE;
-
-				vkDestroyShaderModule(
-					context.device,
-					fragmentShader,
-					nullptr);
-
-				vkDestroyShaderModule(
-					context.device,
-					vertexShader,
-					nullptr);
-
-				return false;
-			}
-
-			vkDestroyShaderModule(
-				context.device,
-				fragmentShader,
-				nullptr);
-
-			vkDestroyShaderModule(
-				context.device,
-				vertexShader,
-				nullptr);
-
-			return true;
-		}
-
-		// ============================================================
-		// Cleanup
-		// ============================================================
-
-		void destroyResources() {
-			auto& context = graphics::internal::context;
-
-			if (context.device == VK_NULL_HANDLE) {
-				return;
-			}
-
-			vkDeviceWaitIdle(context.device);
-
-			if (g_pipeline != VK_NULL_HANDLE) {
-				vkDestroyPipeline(
-					context.device,
-					g_pipeline,
-					nullptr);
-
-				g_pipeline = VK_NULL_HANDLE;
-			}
-
-			if (g_pipelineLayout != VK_NULL_HANDLE) {
-				vkDestroyPipelineLayout(
-					context.device,
-					g_pipelineLayout,
-					nullptr);
-
-				g_pipelineLayout = VK_NULL_HANDLE;
-			}
-
-			if (g_descriptorPool != VK_NULL_HANDLE) {
-				vkDestroyDescriptorPool(
-					context.device,
-					g_descriptorPool,
-					nullptr);
-
-				g_descriptorPool = VK_NULL_HANDLE;
-			}
-
-			if (g_descriptorSetLayout != VK_NULL_HANDLE) {
-				vkDestroyDescriptorSetLayout(
-					context.device,
-					g_descriptorSetLayout,
-					nullptr);
-
-				g_descriptorSetLayout = VK_NULL_HANDLE;
-			}
-
-			for (auto& buffer : g_uniformBuffers) {
-				destroyBuffer(buffer);
-			}
-
-			destroyBuffer(g_indexBuffer);
-			destroyBuffer(g_vertexBuffer);
-
-			for (auto& descriptorSet : g_descriptorSets) {
-				descriptorSet = VK_NULL_HANDLE;
-			}
-		}
-
-		// ============================================================
-		// Per-frame data
-		// ============================================================
-
-		Mat4 createModelMatrix(
-			float x,
-			float y,
-			float z,
-			float rotationXDegrees,
-			float rotationYDegrees,
-			float rotationZDegrees,
-			float scaleX,
-			float scaleY,
-			float scaleZ) {
-
-			const Mat4 translationMatrix =
-				translation(x, y, z);
-
-			const Mat4 scaleMatrix =
-				scale(scaleX, scaleY, scaleZ);
-
-			const Mat4 rx =
-				rotationX(radians(rotationXDegrees));
-
-			const Mat4 ry =
-				rotationY(radians(rotationYDegrees));
-
-			const Mat4 rz =
-				rotationZ(radians(rotationZDegrees));
-
-			const Mat4 rotation =
-				multiply(
-					multiply(rz, ry),
-					rx);
-
-			return multiply(
-				translationMatrix,
-				multiply(rotation, scaleMatrix));
-		}
-
-		void updateUniformBuffer(
-			uint32_t objectIndex,
-			const Mat4& mvp) {
-
-			UniformBufferObject ubo{};
-
-			ubo.mvp = mvp;
-
-			ubo.color[0] = g_color[0];
-			ubo.color[1] = g_color[1];
-			ubo.color[2] = g_color[2];
-			ubo.color[3] = g_color[3];
-
-			std::memcpy(
-				g_uniformBuffers[objectIndex].mapped,
-				&ubo,
-				sizeof(ubo));
-
-			vmaFlushAllocation(
-				graphics::internal::context.allocator,
-				g_uniformBuffers[objectIndex].allocation,
-				0,
-				sizeof(ubo));
-		}
-
-	} // namespace
-
-	// ============================================================
-	// Public application API
-	// ============================================================
-
-	bool initialize() {
-		auto& context = graphics::internal::context;
-
-		const auto indices = createIndices();
-
-		// --------------------------------------------------------
-		// Vertex buffer
-		// --------------------------------------------------------
-
-		if (!createBuffer(
-			sizeof(g_vertices),
-			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-			g_vertexBuffer)) {
-
-			destroyResources();
-			return false;
-		}
-
-		std::memcpy(
-			g_vertexBuffer.mapped,
-			g_vertices.data(),
-			sizeof(g_vertices));
-
-		vmaFlushAllocation(
-			context.allocator,
-			g_vertexBuffer.allocation,
-			0,
-			sizeof(g_vertices));
-
-		// --------------------------------------------------------
-		// Index buffer
-		// --------------------------------------------------------
-
-		if (!createBuffer(
-			sizeof(indices),
-			VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-			g_indexBuffer)) {
-
-			destroyResources();
-			return false;
-		}
-
-		std::memcpy(
-			g_indexBuffer.mapped,
-			indices.data(),
-			sizeof(indices));
-
-		vmaFlushAllocation(
-			context.allocator,
-			g_indexBuffer.allocation,
-			0,
-			sizeof(indices));
-
-		// --------------------------------------------------------
-		// Two uniform buffers = two descriptor sets
-		// --------------------------------------------------------
-
-		for (uint32_t i = 0; i < OBJECT_COUNT; ++i) {
-			if (!createBuffer(
-				sizeof(UniformBufferObject),
-				VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-				g_uniformBuffers[i])) {
-
-				destroyResources();
-				return false;
-			}
-		}
-
-		if (!createDescriptorResources()) {
-			destroyResources();
-			return false;
-		}
-
-		if (!createPipeline()) {
-			destroyResources();
-			return false;
-		}
-
-		g_indexCount = static_cast<uint32_t>(indices.size());
-
-		g_lastTime = 0.0;
-		g_animationTime = 0.0f;
-
-		return true;
-	}
-
-	void shutdown() {
-		destroyResources();
-	}
-
-	void update(double time) {
-		// --------------------------------------------------------
-		// Animation time
-		// --------------------------------------------------------
-
-		const double deltaTime =
-			std::max(0.0, time - g_lastTime);
-
-		g_lastTime = time;
-
-		if (g_animationEnabled) {
-			g_animationTime +=
-				static_cast<float>(deltaTime) *
-				g_animationSpeed;
-		}
-
-		// --------------------------------------------------------
-		// ImGUI
-		// --------------------------------------------------------
-
-		ImGui::Begin("Dodecahedron - Lab #1");
-
-		ImGui::Text("Variant 10: Regular Dodecahedron");
-		ImGui::Text("20 vertices / 12 faces / 30 edges");
-
-		ImGui::Separator();
-
-		ImGui::Text("Projection");
-
-		if (ImGui::RadioButton(
-			"Perspective",
-			g_perspective)) {
-
-			g_perspective = true;
-		}
-
-		ImGui::SameLine();
-
-		if (ImGui::RadioButton(
-			"Orthographic",
-			!g_perspective)) {
-
-			g_perspective = false;
-		}
-
-		ImGui::Separator();
-
-		ImGui::Text("Transform");
-
-		ImGui::SliderFloat3(
-			"Position",
-			g_position,
-			-5.0f,
-			5.0f);
-
-		ImGui::SliderFloat3(
-			"Rotation",
-			g_rotation,
-			-180.0f,
-			180.0f,
-			"%.1f deg");
-
-		ImGui::SliderFloat3(
-			"Scale",
-			g_scale,
-			0.1f,
-			3.0f);
-
-		ImGui::Separator();
-
-		ImGui::Text("Animation");
-
-		ImGui::Checkbox(
-			"Play animation",
-			&g_animationEnabled);
-
-		ImGui::SliderFloat(
-			"Speed",
-			&g_animationSpeed,
-			0.0f,
-			5.0f);
-
-		ImGui::SliderFloat(
-			"Orbit radius",
-			&g_orbitRadius,
-			0.0f,
-			4.0f);
-
-		ImGui::SliderFloat(
-			"Orbit height",
-			&g_orbitHeight,
-			0.0f,
-			3.0f);
-
-		ImGui::SliderFloat(
-			"Orbit frequency",
-			&g_orbitFrequency,
-			0.1f,
-			3.0f);
-
-		ImGui::SliderFloat(
-			"Rotation speed",
-			&g_rotationSpeed,
-			0.0f,
-			180.0f);
-
-		if (ImGui::Button("Reset animation")) {
-			g_animationTime = 0.0f;
-		}
-
-		ImGui::Separator();
-
-		ImGui::Text("Appearance");
-
-		ImGui::ColorEdit4(
-			"Object color",
-			g_color);
-
-		ImGui::Checkbox(
-			"Show second object",
-			&g_showSecondObject);
-
-		ImGui::End();
-	}
-
-	void render(const graphics::internal::FrameData& fd) {
-		auto& context = graphics::internal::context;
-
-		// --------------------------------------------------------
-		// Command buffer
-		// --------------------------------------------------------
-
-		const VkCommandBufferBeginInfo commandBufferBegin = {
-			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-			.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT
-		};
-
-		if (vkBeginCommandBuffer(
-			fd.command_buffer,
-			&commandBufferBegin) != VK_SUCCESS) {
-
-			std::cerr << "vkBeginCommandBuffer failed\n";
-			return;
-		}
-
-		// --------------------------------------------------------
-		// Render pass
-		// --------------------------------------------------------
-
-		const VkClearValue clearValues[] = {
-			{
-				.color = {
-					.float32 = {
-						0.015f,
-						0.02f,
-						0.035f,
-						1.0f
-					}
-				}
-			},
-			{
-				.depthStencil = {
-					.depth = 1.0f,
-					.stencil = 0
-				}
-			}
-		};
-
-		const VkRenderPassBeginInfo renderPassBegin = {
-			.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-			.renderPass = context.render_pass,
-			.framebuffer = fd.framebuffer,
-			.renderArea = {
-				.offset = { 0, 0 },
-				.extent = context.swapchain_extent
-			},
-			.clearValueCount = 2,
-			.pClearValues = clearValues
-		};
-
-		vkCmdBeginRenderPass(
-			fd.command_buffer,
-			&renderPassBegin,
-			VK_SUBPASS_CONTENTS_INLINE);
-
-		// --------------------------------------------------------
-		// Dynamic viewport/scissor
-		// --------------------------------------------------------
-
-		const VkViewport viewport = {
-			.x = 0.0f,
-			.y = 0.0f,
-			.width =
-				static_cast<float>(context.swapchain_extent.width),
-			.height =
-				static_cast<float>(context.swapchain_extent.height),
-			.minDepth = 0.0f,
-			.maxDepth = 1.0f
-		};
-
-		const VkRect2D scissor = {
-			.offset = { 0, 0 },
-			.extent = context.swapchain_extent
-		};
-
-		vkCmdSetViewport(
-			fd.command_buffer,
-			0,
-			1,
-			&viewport);
-
-		vkCmdSetScissor(
-			fd.command_buffer,
-			0,
-			1,
-			&scissor);
-
-		// --------------------------------------------------------
-		// Pipeline
-		// --------------------------------------------------------
-
-		vkCmdBindPipeline(
-			fd.command_buffer,
-			VK_PIPELINE_BIND_POINT_GRAPHICS,
-			g_pipeline);
-
-		const VkDeviceSize vertexOffset = 0;
-
-		vkCmdBindVertexBuffers(
-			fd.command_buffer,
-			0,
-			1,
-			&g_vertexBuffer.buffer,
-			&vertexOffset);
-
-		vkCmdBindIndexBuffer(
-			fd.command_buffer,
-			g_indexBuffer.buffer,
-			0,
-			VK_INDEX_TYPE_UINT32);
-
-		// --------------------------------------------------------
-		// Camera / projection
-		// --------------------------------------------------------
-
-		const float width =
-			static_cast<float>(context.swapchain_extent.width);
-
-		const float height =
-			static_cast<float>(context.swapchain_extent.height);
-
-		const float aspect =
-			height > 0.0f
-			? width / height
-			: 1.0f;
-
-		Mat4 projection;
-
-		if (g_perspective) {
-			projection = perspective(
-				radians(55.0f),
-				aspect,
-				0.1f,
-				100.0f);
-		}
-		else {
-			const float orthoHeight = 7.0f;
-			const float orthoWidth =
-				orthoHeight * aspect;
-
-			projection = orthographic(
-				-orthoWidth,
-				orthoWidth,
-				-orthoHeight,
-				orthoHeight,
-				0.1f,
-				100.0f);
-		}
-
-		// Camera is at (0, 0, +8) looking towards -Z.
-		const Mat4 view =
-			translation(0.0f, 0.0f, -8.0f);
-
-		// --------------------------------------------------------
-		// Object 1 animation
-		// --------------------------------------------------------
-
-		const float t =
-			g_animationTime * g_orbitFrequency;
-
-		const float orbitX =
-			std::cos(t) * g_orbitRadius;
-
-		const float orbitZ =
-			std::sin(t) * g_orbitRadius;
-
-		const float orbitY =
-			std::sin(t * 2.0f) * g_orbitHeight;
-
-		const float rotationAnimation =
-			g_animationTime * g_rotationSpeed;
-
-		const Mat4 model1 = createModelMatrix(
-			g_position[0] + orbitX,
-			g_position[1] + orbitY,
-			g_position[2] + orbitZ,
-
-			g_rotation[0] + rotationAnimation * 0.7f,
-			g_rotation[1] + rotationAnimation,
-			g_rotation[2] + rotationAnimation * 0.35f,
-
-			g_scale[0],
-			g_scale[1],
-			g_scale[2]);
-
-		const Mat4 mvp1 =
-			multiply(
-				projection,
-				multiply(view, model1));
-
-		updateUniformBuffer(
-			0,
-			mvp1);
-
-		// --------------------------------------------------------
-		// Draw object 1
-		// --------------------------------------------------------
-
-		vkCmdBindDescriptorSets(
-			fd.command_buffer,
-			VK_PIPELINE_BIND_POINT_GRAPHICS,
-			g_pipelineLayout,
-			0,
-			1,
-			&g_descriptorSets[0],
-			0,
-			nullptr);
-
-		vkCmdDrawIndexed(
-			fd.command_buffer,
-			g_indexCount,
-			1,
-			0,
-			0,
-			0);
-
-		// --------------------------------------------------------
-		// Object 2
-		// --------------------------------------------------------
-
-		if (g_showSecondObject) {
-			const Mat4 model2 = createModelMatrix(
-				g_position[0] - 3.2f - orbitX * 0.65f,
-				g_position[1] - orbitY * 0.5f,
-				g_position[2] - orbitZ * 0.65f,
-
-				g_rotation[0] - rotationAnimation * 0.5f,
-				g_rotation[1] - rotationAnimation * 0.8f,
-				g_rotation[2] + rotationAnimation * 0.25f,
-
-				g_scale[0] * 0.85f,
-				g_scale[1] * 0.85f,
-				g_scale[2] * 0.85f);
-
-			const Mat4 mvp2 =
-				multiply(
-					projection,
-					multiply(view, model2));
-
-			updateUniformBuffer(
-				1,
-				mvp2);
-
-			vkCmdBindDescriptorSets(
-				fd.command_buffer,
-				VK_PIPELINE_BIND_POINT_GRAPHICS,
-				g_pipelineLayout,
-				0,
-				1,
-				&g_descriptorSets[1],
-				0,
-				nullptr);
-
-			vkCmdDrawIndexed(
-				fd.command_buffer,
-				g_indexCount,
-				1,
-				0,
-				0,
-				0);
-		}
-
-		// --------------------------------------------------------
-		// Finish render pass / command buffer
-		// --------------------------------------------------------
-
-		vkCmdEndRenderPass(
-			fd.command_buffer);
-
-		if (vkEndCommandBuffer(
-			fd.command_buffer) != VK_SUCCESS) {
-
-			std::cerr << "vkEndCommandBuffer failed\n";
-			return;
-		}
-	}
+    namespace {
+
+        using glm::mat4;
+        using glm::vec3;
+        using glm::vec4;
+
+        constexpr float PI = 3.14159265358979323846f;
+        constexpr uint32_t MODEL_COUNT = 3;
+
+        constexpr ImGuiSliderFlags CLAMP = ImGuiSliderFlags_AlwaysClamp;
+
+        struct Vertex {
+            vec3 position;
+            vec3 normal;
+        };
+
+        struct Buffer {
+            VkBuffer handle = VK_NULL_HANDLE;
+            VmaAllocation allocation = VK_NULL_HANDLE;
+            void* mapped = nullptr;
+            VkDeviceSize size = 0;
+        };
+
+        struct Mesh {
+            Buffer vertices;
+            uint32_t count = 0;
+        };
+
+        // vec4-sized fields keep CPU and GLSL layouts identical.
+        struct alignas(16) SceneGpu {
+            mat4 viewProjection{ 1.0f };
+            vec4 cameraPosition{};
+            vec4 ambient{};
+            vec4 sunDirection{};
+            vec4 sunColorIntensity{};
+            glm::uvec4 counts{};
+        };
+
+        struct alignas(16) ModelGpu {
+            mat4 model{ 1.0f };
+            mat4 normalMatrix{ 1.0f };
+            vec4 albedo{ 1.0f };
+            vec4 specularShininess{ 1.0f };
+            vec4 options{};
+        };
+
+        struct alignas(16) PointGpu {
+            vec4 position{ 0.0f, 3.0f, 2.0f, 1.0f };
+            vec4 colorIntensity{ 1.0f, 0.7f, 0.3f, 25.0f };
+        };
+
+        struct alignas(16) SpotGpu {
+            vec4 position{ 3.0f, 4.0f, 3.0f, 1.0f };
+            vec4 directionCosOuter{ -1.0f, -1.0f, -1.0f, 0.0f };
+            vec4 colorIntensity{ 1.0f, 0.95f, 0.75f, 60.0f };
+            vec4 cone{};
+        };
+
+        struct Spot {
+            SpotGpu gpu{};
+            float innerAngle = 18.0f;
+            float outerAngle = 30.0f;
+        };
+
+        struct alignas(16) Push {
+            mat4 transform{ 1.0f };
+            vec4 color{ 1.0f };
+            glm::ivec4 flags{};
+        };
+
+        static_assert(sizeof(Vertex) == 24);
+        static_assert(sizeof(SceneGpu) == 144);
+        static_assert(sizeof(ModelGpu) == 176);
+        static_assert(sizeof(PointGpu) == 32);
+        static_assert(sizeof(SpotGpu) == 64);
+        static_assert(sizeof(Push) == 96);
+
+        static_assert(offsetof(SceneGpu, cameraPosition) == 64);
+        static_assert(offsetof(SceneGpu, counts) == 128);
+        static_assert(offsetof(ModelGpu, albedo) == 128);
+        static_assert(offsetof(ModelGpu, options) == 160);
+        static_assert(offsetof(Push, flags) == 80);
+
+        struct Model {
+            vec3 position{ 0.0f };
+            vec3 rotation{ 0.0f };
+            vec3 scale{ 1.0f };
+
+            vec3 albedo{ 0.2f, 0.65f, 1.0f };
+            vec3 specular{ 0.8f };
+            float shininess = 64.0f;
+
+            bool proceduralColor = false;
+            bool visible = true;
+        };
+
+        struct Camera {
+            vec3 position{ 0.0f, 2.0f, 10.0f };
+
+            // Pitch, yaw, roll in degrees.
+            vec3 angles{ -12.0f, -90.0f, 0.0f };
+
+            float fov = 55.0f;
+            float nearPlane = 0.1f;
+            float farPlane = 200.0f;
+            float orthoHeight = 9.0f;
+            float speed = 5.0f;
+
+            bool perspective = true;
+        };
+
+        Camera camera;
+        std::array<Model, MODEL_COUNT> models;
+
+        std::vector<PointGpu> points;
+        std::vector<Spot> spots;
+
+        vec3 ambientColor{ 1.0f };
+        float ambientIntensity = 0.08f;
+
+        vec3 sunDirection{ -0.5f, -1.0f, -0.3f };
+        vec3 sunColor{ 1.0f };
+        float sunIntensity = 0.7f;
+        bool sunEnabled = true;
+
+        bool showMarkers = true;
+        bool showCones = true;
+        float markerSize = 0.16f;
+        float coneLength = 3.0f;
+
+        bool animateModels = false;
+        float animationSpeed = 1.0f;
+        float orbitRadius = 0.7f;
+        float orbitHeight = 0.35f;
+        float orbitFrequency = 1.0f;
+        float rotationSpeed = 30.0f;
+
+        double lastTime = -1.0;
+        double animationTime = 0.0;
+
+        Mesh dodecahedron;
+        Mesh floorMesh;
+        Mesh cubeMesh;
+        Mesh coneMesh;
+
+        Buffer sceneBuffer;
+        Buffer pointBuffer;
+        Buffer spotBuffer;
+        std::array<Buffer, MODEL_COUNT> modelBuffers;
+
+        VkDescriptorSetLayout sceneLayout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout modelLayout = VK_NULL_HANDLE;
+        VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+
+        VkDescriptorSet sceneSet = VK_NULL_HANDLE;
+        std::array<VkDescriptorSet, MODEL_COUNT> modelSets{};
+
+        VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+        VkPipeline trianglePipeline = VK_NULL_HANDLE;
+        VkPipeline linePipeline = VK_NULL_HANDLE;
+
+        VkDeviceSize maxStorageRange = 0;
+
+        void check(VkResult result, const char* operation) {
+            if (result != VK_SUCCESS) {
+                throw std::runtime_error(
+                    std::string(operation) + ": VkResult = " +
+                    std::to_string(static_cast<int>(result)));
+            }
+        }
+
+        vec3 safeNormalize(vec3 value, vec3 fallback = vec3(0.0f, -1.0f, 0.0f)) {
+            const float squaredLength = glm::dot(value, value);
+            if (squaredLength < 1e-12f) {
+                return fallback;
+            }
+            return value / std::sqrt(squaredLength);
+        }
+
+        void destroyBuffer(Buffer& buffer) {
+            if (buffer.handle) {
+                vmaDestroyBuffer(
+                    graphics::internal::context.allocator,
+                    buffer.handle,
+                    buffer.allocation);
+            }
+            buffer = {};
+        }
+
+        Buffer createBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+            auto& context = graphics::internal::context;
+
+            Buffer result{};
+
+            VkBufferCreateInfo bufferInfo{
+                VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+            };
+            bufferInfo.size = size;
+            bufferInfo.usage = usage;
+            bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+            VmaAllocationCreateInfo allocationInfo{};
+            allocationInfo.flags =
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            allocationInfo.usage = VMA_MEMORY_USAGE_AUTO;
+
+            VmaAllocationInfo actualInfo{};
+
+            check(vmaCreateBuffer(
+                context.allocator,
+                &bufferInfo,
+                &allocationInfo,
+                &result.handle,
+                &result.allocation,
+                &actualInfo),
+                "vmaCreateBuffer");
+
+            result.size = size;
+            result.mapped = actualInfo.pMappedData;
+
+            if (!result.mapped) {
+                destroyBuffer(result);
+                throw std::runtime_error("Buffer is not host-mapped");
+            }
+
+            return result;
+        }
+
+        void upload(Buffer& buffer, const void* data, size_t bytes) {
+            if (bytes == 0) {
+                return;
+            }
+
+            if (bytes > buffer.size) {
+                throw std::runtime_error("Buffer upload exceeds allocation");
+            }
+
+            std::memcpy(buffer.mapped, data, bytes);
+
+            check(vmaFlushAllocation(
+                graphics::internal::context.allocator,
+                buffer.allocation,
+                0,
+                static_cast<VkDeviceSize>(bytes)),
+                "vmaFlushAllocation");
+        }
+
+        Mesh createMesh(const std::vector<Vertex>& vertices) {
+            Mesh mesh{};
+            mesh.count = static_cast<uint32_t>(vertices.size());
+
+            mesh.vertices = createBuffer(
+                vertices.size() * sizeof(Vertex),
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+
+            try {
+                upload(
+                    mesh.vertices, vertices.data(),
+                    vertices.size() * sizeof(Vertex));
+            }
+            catch (...) {
+                destroyBuffer(mesh.vertices);
+                throw;
+            }
+
+            return mesh;
+        }
+
+        std::vector<Vertex> createDodecahedron() {
+            constexpr float phi = 1.6180339887498948482f;
+            constexpr float invPhi = 0.6180339887498948482f;
+
+            const std::array<vec3, 20> vertices = { {
+                {-1, -1, -1}, {-1, -1,  1},
+                {-1,  1, -1}, {-1,  1,  1},
+                { 1, -1, -1}, { 1, -1,  1},
+                { 1,  1, -1}, { 1,  1,  1},
+
+                {0, -invPhi, -phi}, {0, -invPhi, phi},
+                {0,  invPhi, -phi}, {0,  invPhi, phi},
+
+                {-invPhi, -phi, 0}, {-invPhi, phi, 0},
+                { invPhi, -phi, 0}, { invPhi, phi, 0},
+
+                {-phi, 0, -invPhi}, {phi, 0, -invPhi},
+                {-phi, 0,  invPhi}, {phi, 0,  invPhi}
+            } };
+
+            const std::array<std::array<int, 5>, 12> faces = { {
+                {{18, 16,  0, 12,  1}},
+                {{10,  8,  0, 16,  2}},
+                {{14, 12,  0,  8,  4}},
+                {{ 3, 18,  1,  9, 11}},
+                {{ 5,  9,  1, 12, 14}},
+                {{ 3, 13,  2, 16, 18}},
+                {{ 6, 10,  2, 13, 15}},
+                {{15, 13,  3, 11,  7}},
+                {{ 5, 14,  4, 17, 19}},
+                {{ 6, 17,  4,  8, 10}},
+                {{11,  9,  5, 19,  7}},
+                {{19, 17,  6, 15,  7}}
+            } };
+
+            std::vector<Vertex> result;
+            result.reserve(108);
+
+            for (const auto& face : faces) {
+                const vec3 a = vertices[face[0]];
+                const vec3 b = vertices[face[1]];
+                const vec3 c = vertices[face[2]];
+
+                vec3 normal = safeNormalize(glm::cross(b - a, c - a));
+
+                const bool reverse = glm::dot(normal, a) < 0.0f;
+                if (reverse) {
+                    normal = -normal;
+                }
+
+                // Duplicate vertices across faces to preserve flat normals.
+                for (int i = 1; i < 4; ++i) {
+                    vec3 p1 = vertices[face[i]];
+                    vec3 p2 = vertices[face[i + 1]];
+
+                    if (reverse) {
+                        std::swap(p1, p2);
+                    }
+
+                    result.push_back({ a, normal });
+                    result.push_back({ p1, normal });
+                    result.push_back({ p2, normal });
+                }
+            }
+
+            return result;
+        }
+
+        std::vector<Vertex> createFloor() {
+            const vec3 n(0.0f, 1.0f, 0.0f);
+
+            return {
+                {{-0.5f, 0.0f, -0.5f}, n},
+                {{-0.5f, 0.0f,  0.5f}, n},
+                {{ 0.5f, 0.0f,  0.5f}, n},
+
+                {{-0.5f, 0.0f, -0.5f}, n},
+                {{ 0.5f, 0.0f,  0.5f}, n},
+                {{ 0.5f, 0.0f, -0.5f}, n}
+            };
+        }
+
+        std::vector<Vertex> createCube() {
+            std::vector<Vertex> result;
+
+            for (vec3 n : {
+                vec3(1, 0, 0), vec3(-1, 0, 0),
+                    vec3(0, 1, 0), vec3(0, -1, 0),
+                    vec3(0, 0, 1), vec3(0, 0, -1)
+            }) {
+                const vec3 reference =
+                    std::abs(n.y) < 0.9f ? vec3(0, 1, 0) : vec3(1, 0, 0);
+
+                const vec3 u = safeNormalize(glm::cross(reference, n)) * 0.5f;
+                const vec3 v = glm::cross(n, u);
+                const vec3 center = n * 0.5f;
+
+                const vec3 a = center - u - v;
+                const vec3 b = center + u - v;
+                const vec3 c = center + u + v;
+                const vec3 d = center - u + v;
+
+                for (vec3 p : {a, b, c, a, c, d}) {
+                    result.push_back({ p, n });
+                }
+            }
+
+            return result;
+        }
+
+        std::vector<Vertex> createConeLines() {
+            // Unit cone: apex at origin, axis along -Z, radius 1 at z = -1.
+            constexpr int segments = 48;
+            std::vector<Vertex> result;
+
+            auto addLine = [&](vec3 a, vec3 b) {
+                result.push_back({ a, vec3(0, 1, 0) });
+                result.push_back({ b, vec3(0, 1, 0) });
+                };
+
+            for (int i = 0; i < segments; ++i) {
+                const float a = 2.0f * PI * float(i) / float(segments);
+                const float b = 2.0f * PI * float(i + 1) / float(segments);
+
+                const vec3 p0(std::cos(a), std::sin(a), -1.0f);
+                const vec3 p1(std::cos(b), std::sin(b), -1.0f);
+
+                addLine(p0, p1);
+
+                if (i % 12 == 0) {
+                    addLine(vec3(0.0f), p0);
+                }
+            }
+
+            addLine(vec3(0.0f), vec3(0, 0, -1.2f));
+            return result;
+        }
+
+        void writeDescriptor(
+            VkDescriptorSet set,
+            uint32_t binding,
+            VkDescriptorType type,
+            const Buffer& buffer) {
+
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = buffer.handle;
+            bufferInfo.range = buffer.size;
+
+            VkWriteDescriptorSet write{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+            };
+
+            write.dstSet = set;
+            write.dstBinding = binding;
+            write.descriptorCount = 1;
+            write.descriptorType = type;
+            write.pBufferInfo = &bufferInfo;
+
+            vkUpdateDescriptorSets(
+                graphics::internal::context.device,
+                1, &write, 0, nullptr);
+        }
+
+        void createDescriptors() {
+            const auto device = graphics::internal::context.device;
+
+            VkDescriptorSetLayoutBinding sceneBindings[3]{};
+
+            sceneBindings[0].binding = 0;
+            sceneBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            sceneBindings[0].descriptorCount = 1;
+            sceneBindings[0].stageFlags =
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+            for (uint32_t i = 1; i <= 2; ++i) {
+                sceneBindings[i].binding = i;
+                sceneBindings[i].descriptorType =
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                sceneBindings[i].descriptorCount = 1;
+                sceneBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            }
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+            };
+
+            layoutInfo.bindingCount = 3;
+            layoutInfo.pBindings = sceneBindings;
+
+            check(vkCreateDescriptorSetLayout(
+                device, &layoutInfo, nullptr, &sceneLayout),
+                "vkCreateDescriptorSetLayout(scene)");
+
+            VkDescriptorSetLayoutBinding modelBinding{};
+            modelBinding.binding = 0;
+            modelBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            modelBinding.descriptorCount = 1;
+            modelBinding.stageFlags =
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+            layoutInfo.bindingCount = 1;
+            layoutInfo.pBindings = &modelBinding;
+
+            check(vkCreateDescriptorSetLayout(
+                device, &layoutInfo, nullptr, &modelLayout),
+                "vkCreateDescriptorSetLayout(model)");
+
+            const VkDescriptorPoolSize sizes[] = {
+                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MODEL_COUNT + 1},
+                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}
+            };
+
+            VkDescriptorPoolCreateInfo poolInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+            };
+
+            poolInfo.maxSets = MODEL_COUNT + 1;
+            poolInfo.poolSizeCount = 2;
+            poolInfo.pPoolSizes = sizes;
+
+            check(vkCreateDescriptorPool(
+                device, &poolInfo, nullptr, &descriptorPool),
+                "vkCreateDescriptorPool");
+
+            VkDescriptorSetAllocateInfo allocationInfo{
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+            };
+
+            allocationInfo.descriptorPool = descriptorPool;
+            allocationInfo.descriptorSetCount = 1;
+            allocationInfo.pSetLayouts = &sceneLayout;
+
+            check(vkAllocateDescriptorSets(
+                device, &allocationInfo, &sceneSet),
+                "vkAllocateDescriptorSets(scene)");
+
+            std::array<VkDescriptorSetLayout, MODEL_COUNT> layouts{};
+            layouts.fill(modelLayout);
+
+            allocationInfo.descriptorSetCount = MODEL_COUNT;
+            allocationInfo.pSetLayouts = layouts.data();
+
+            check(vkAllocateDescriptorSets(
+                device, &allocationInfo, modelSets.data()),
+                "vkAllocateDescriptorSets(models)");
+
+            writeDescriptor(
+                sceneSet, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sceneBuffer);
+            writeDescriptor(
+                sceneSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pointBuffer);
+            writeDescriptor(
+                sceneSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spotBuffer);
+
+            for (uint32_t i = 0; i < MODEL_COUNT; ++i) {
+                writeDescriptor(
+                    modelSets[i], 0,
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    modelBuffers[i]);
+            }
+        }
+
+        template<class T>
+        void uploadLights(
+            Buffer& buffer,
+            uint32_t binding,
+            const std::vector<T>& data) {
+
+            if (data.size() > maxStorageRange / sizeof(T)) {
+                throw std::runtime_error(
+                    "Light array exceeds maxStorageBufferRange");
+            }
+
+            const VkDeviceSize required = std::max<VkDeviceSize>(
+                sizeof(T),
+                static_cast<VkDeviceSize>(data.size()) * sizeof(T));
+
+            if (required > buffer.size) {
+                const VkDeviceSize newSize = std::max(
+                    required,
+                    std::min(maxStorageRange, buffer.size * 2));
+
+                Buffer replacement = createBuffer(
+                    newSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+                // prepare() already waited for the previous frame.
+                // This frame has not bound this descriptor set yet.
+                destroyBuffer(buffer);
+                buffer = replacement;
+
+                writeDescriptor(
+                    sceneSet, binding,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, buffer);
+            }
+
+            upload(buffer, data.data(), data.size() * sizeof(T));
+        }
+
+        VkShaderModule loadShader(const char* path) {
+            std::ifstream file(path, std::ios::binary | std::ios::ate);
+
+            if (!file) {
+                throw std::runtime_error(
+                    std::string("Cannot open shader: ") + path);
+            }
+
+            const std::streamsize size =
+                static_cast<std::streamsize>(file.tellg());
+
+            if (size <= 0 || size % 4 != 0) {
+                throw std::runtime_error("Invalid SPIR-V size");
+            }
+
+            std::vector<uint32_t> code(static_cast<size_t>(size) / 4);
+
+            file.seekg(0);
+            if (!file.read(reinterpret_cast<char*>(code.data()), size)) {
+                throw std::runtime_error("Cannot read SPIR-V");
+            }
+
+            VkShaderModuleCreateInfo info{
+                VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO
+            };
+
+            info.codeSize = static_cast<size_t>(size);
+            info.pCode = code.data();
+
+            VkShaderModule result = VK_NULL_HANDLE;
+
+            check(vkCreateShaderModule(
+                graphics::internal::context.device,
+                &info, nullptr, &result),
+                "vkCreateShaderModule");
+
+            return result;
+        }
+
+        VkPipeline createPipeline(
+            VkShaderModule vertexShader,
+            VkShaderModule fragmentShader,
+            VkPrimitiveTopology topology) {
+
+            auto& context = graphics::internal::context;
+
+            VkPipelineShaderStageCreateInfo stages[2]{};
+
+            stages[0].sType =
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vertexShader;
+            stages[0].pName = "main";
+
+            stages[1].sType =
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = fragmentShader;
+            stages[1].pName = "main";
+
+            VkVertexInputBindingDescription binding{};
+            binding.binding = 0;
+            binding.stride = sizeof(Vertex);
+            binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+            const VkVertexInputAttributeDescription attributes[] = {
+                {
+                    0, 0, VK_FORMAT_R32G32B32_SFLOAT,
+                    static_cast<uint32_t>(offsetof(Vertex, position))
+                },
+                {
+                    1, 0, VK_FORMAT_R32G32B32_SFLOAT,
+                    static_cast<uint32_t>(offsetof(Vertex, normal))
+                }
+            };
+
+            VkPipelineVertexInputStateCreateInfo vertexInput{
+                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
+            };
+
+            vertexInput.vertexBindingDescriptionCount = 1;
+            vertexInput.pVertexBindingDescriptions = &binding;
+            vertexInput.vertexAttributeDescriptionCount = 2;
+            vertexInput.pVertexAttributeDescriptions = attributes;
+
+            VkPipelineInputAssemblyStateCreateInfo assembly{
+                VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO
+            };
+            assembly.topology = topology;
+
+            VkPipelineViewportStateCreateInfo viewport{
+                VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO
+            };
+            viewport.viewportCount = 1;
+            viewport.scissorCount = 1;
+
+            VkPipelineRasterizationStateCreateInfo rasterization{
+                VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO
+            };
+
+            rasterization.polygonMode = VK_POLYGON_MODE_FILL;
+            rasterization.cullMode = VK_CULL_MODE_NONE;
+            rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rasterization.lineWidth = 1.0f;
+
+            VkPipelineMultisampleStateCreateInfo multisampling{
+                VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO
+            };
+            multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            VkPipelineDepthStencilStateCreateInfo depth{
+                VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO
+            };
+
+            depth.depthTestEnable = VK_TRUE;
+            depth.depthWriteEnable =
+                topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+                ? VK_TRUE : VK_FALSE;
+            depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+            VkPipelineColorBlendAttachmentState blendAttachment{};
+            blendAttachment.colorWriteMask =
+                VK_COLOR_COMPONENT_R_BIT |
+                VK_COLOR_COMPONENT_G_BIT |
+                VK_COLOR_COMPONENT_B_BIT |
+                VK_COLOR_COMPONENT_A_BIT;
+
+            VkPipelineColorBlendStateCreateInfo blend{
+                VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO
+            };
+            blend.attachmentCount = 1;
+            blend.pAttachments = &blendAttachment;
+
+            const VkDynamicState dynamicStates[] = {
+                VK_DYNAMIC_STATE_VIEWPORT,
+                VK_DYNAMIC_STATE_SCISSOR
+            };
+
+            VkPipelineDynamicStateCreateInfo dynamic{
+                VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+            };
+            dynamic.dynamicStateCount = 2;
+            dynamic.pDynamicStates = dynamicStates;
+
+            VkGraphicsPipelineCreateInfo info{
+                VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO
+            };
+
+            info.stageCount = 2;
+            info.pStages = stages;
+            info.pVertexInputState = &vertexInput;
+            info.pInputAssemblyState = &assembly;
+            info.pViewportState = &viewport;
+            info.pRasterizationState = &rasterization;
+            info.pMultisampleState = &multisampling;
+            info.pDepthStencilState = &depth;
+            info.pColorBlendState = &blend;
+            info.pDynamicState = &dynamic;
+            info.layout = pipelineLayout;
+            info.renderPass = context.render_pass;
+            info.subpass = 0;
+
+            VkPipeline result = VK_NULL_HANDLE;
+
+            check(vkCreateGraphicsPipelines(
+                context.device, VK_NULL_HANDLE, 1,
+                &info, nullptr, &result),
+                "vkCreateGraphicsPipelines");
+
+            return result;
+        }
+
+        void createPipelines() {
+            const auto device = graphics::internal::context.device;
+
+            const VkDescriptorSetLayout layouts[] = {
+                sceneLayout, modelLayout
+            };
+
+            VkPushConstantRange pushRange{};
+            pushRange.stageFlags =
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            pushRange.size = sizeof(Push);
+
+            VkPipelineLayoutCreateInfo layoutInfo{
+                VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO
+            };
+
+            layoutInfo.setLayoutCount = 2;
+            layoutInfo.pSetLayouts = layouts;
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &pushRange;
+
+            check(vkCreatePipelineLayout(
+                device, &layoutInfo, nullptr, &pipelineLayout),
+                "vkCreatePipelineLayout");
+
+            VkShaderModule vertexShader = VK_NULL_HANDLE;
+            VkShaderModule fragmentShader = VK_NULL_HANDLE;
+
+            try {
+                vertexShader = loadShader(SHADER_DIR "/basic.vert.spv");
+                fragmentShader = loadShader(SHADER_DIR "/basic.frag.spv");
+
+                trianglePipeline = createPipeline(
+                    vertexShader, fragmentShader,
+                    VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+
+                linePipeline = createPipeline(
+                    vertexShader, fragmentShader,
+                    VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+            }
+            catch (...) {
+                if (fragmentShader) {
+                    vkDestroyShaderModule(device, fragmentShader, nullptr);
+                }
+                if (vertexShader) {
+                    vkDestroyShaderModule(device, vertexShader, nullptr);
+                }
+                throw;
+            }
+
+            vkDestroyShaderModule(device, fragmentShader, nullptr);
+            vkDestroyShaderModule(device, vertexShader, nullptr);
+        }
+
+        void cameraBasis(vec3& forward, vec3& right, vec3& up) {
+            const float pitch = glm::radians(camera.angles.x);
+            const float yaw = glm::radians(camera.angles.y);
+            const float roll = glm::radians(camera.angles.z);
+
+            forward = safeNormalize(vec3(
+                std::cos(pitch) * std::cos(yaw),
+                std::sin(pitch),
+                std::cos(pitch) * std::sin(yaw)),
+                vec3(0, 0, -1));
+
+            right = safeNormalize(
+                glm::cross(forward, vec3(0, 1, 0)),
+                vec3(1, 0, 0));
+
+            up = safeNormalize(glm::cross(right, forward), vec3(0, 1, 0));
+
+            right = right * std::cos(roll) + up * std::sin(roll);
+            up = safeNormalize(glm::cross(right, forward), vec3(0, 1, 0));
+        }
+
+        void updateCameraInput(float deltaTime) {
+            ImGuiIO& io = ImGui::GetIO();
+
+            if (!io.WantCaptureMouse) {
+                camera.fov = std::clamp(
+                    camera.fov - io.MouseWheel * 2.0f, 15.0f, 100.0f);
+
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Right) &&
+                    !io.WantTextInput) {
+                    camera.angles.y += io.MouseDelta.x * 0.18f;
+                    camera.angles.x -= io.MouseDelta.y * 0.18f;
+                    camera.angles.x = std::clamp(
+                        camera.angles.x, -89.0f, 89.0f);
+
+                    if (!io.WantCaptureKeyboard) {
+                        vec3 forward, right, up;
+                        cameraBasis(forward, right, up);
+
+                        vec3 movement(0.0f);
+
+                        if (ImGui::IsKeyDown(ImGuiKey_W)) movement += forward;
+                        if (ImGui::IsKeyDown(ImGuiKey_S)) movement -= forward;
+                        if (ImGui::IsKeyDown(ImGuiKey_D)) movement += right;
+                        if (ImGui::IsKeyDown(ImGuiKey_A)) movement -= right;
+                        if (ImGui::IsKeyDown(ImGuiKey_E)) movement += up;
+                        if (ImGui::IsKeyDown(ImGuiKey_Q)) movement -= up;
+
+                        if (glm::dot(movement, movement) > 0.0f) {
+                            const float multiplier =
+                                ImGui::IsKeyDown(ImGuiKey_LeftShift)
+                                ? 3.0f : 1.0f;
+
+                            camera.position +=
+                                safeNormalize(movement) *
+                                camera.speed * multiplier * deltaTime;
+                        }
+                    }
+                }
+            }
+
+            camera.angles.y = std::remainder(camera.angles.y, 360.0f);
+        }
+
+        void drawCameraUI() {
+            ImGui::Checkbox("Perspective", &camera.perspective);
+
+            ImGui::DragFloat3(
+                "Camera position", glm::value_ptr(camera.position), 0.05f);
+
+            ImGui::SliderFloat(
+                "Pitch", &camera.angles.x, -89.0f, 89.0f, "%.1f deg", CLAMP);
+            ImGui::SliderFloat(
+                "Yaw", &camera.angles.y, -180.0f, 180.0f, "%.1f deg", CLAMP);
+            ImGui::SliderFloat(
+                "Roll", &camera.angles.z, -180.0f, 180.0f, "%.1f deg", CLAMP);
+
+            ImGui::SliderFloat(
+                "Field of view", &camera.fov, 15.0f, 100.0f, "%.1f deg", CLAMP);
+
+            ImGui::SliderFloat(
+                "Orthographic height", &camera.orthoHeight,
+                1.0f, 40.0f, "%.2f", CLAMP);
+
+            ImGui::SliderFloat(
+                "Near plane", &camera.nearPlane,
+                0.01f, 2.0f, "%.3f", CLAMP);
+
+            ImGui::SliderFloat(
+                "Far plane", &camera.farPlane,
+                10.0f, 500.0f, "%.1f", CLAMP);
+
+            ImGui::SliderFloat(
+                "Movement speed", &camera.speed,
+                0.2f, 20.0f, "%.2f", CLAMP);
+
+            if (ImGui::Button("Reset camera")) {
+                camera = Camera{};
+            }
+
+            ImGui::TextWrapped(
+                "Outside UI: hold RMB to look and use W/A/S/D, Q/E. "
+                "Shift accelerates. Mouse wheel changes FOV.");
+        }
+
+        void drawModelsUI() {
+            const char* names[] = {
+                "Dodecahedron 1",
+                "Dodecahedron 2",
+                "Floor"
+            };
+
+            for (uint32_t i = 0; i < MODEL_COUNT; ++i) {
+                ImGui::PushID(static_cast<int>(i));
+
+                if (ImGui::TreeNode(names[i])) {
+                    auto& model = models[i];
+
+                    ImGui::Checkbox("Visible", &model.visible);
+
+                    ImGui::DragFloat3(
+                        "Position", glm::value_ptr(model.position), 0.03f);
+
+                    ImGui::SliderFloat3(
+                        "Rotation", glm::value_ptr(model.rotation),
+                        -180.0f, 180.0f, "%.1f", CLAMP);
+
+                    ImGui::SliderFloat3(
+                        "Scale", glm::value_ptr(model.scale),
+                        0.05f, 15.0f, "%.2f", CLAMP);
+
+                    ImGui::ColorEdit3(
+                        "Albedo", glm::value_ptr(model.albedo));
+
+                    ImGui::ColorEdit3(
+                        "Specular color", glm::value_ptr(model.specular));
+
+                    ImGui::SliderFloat(
+                        "Shininess", &model.shininess,
+                        1.0f, 256.0f, "%.1f", CLAMP);
+
+                    ImGui::Checkbox(
+                        "Procedural vertex colors", &model.proceduralColor);
+
+                    ImGui::TreePop();
+                }
+
+                ImGui::PopID();
+            }
+
+            ImGui::Separator();
+
+            ImGui::Checkbox("Animate dodecahedra", &animateModels);
+
+            ImGui::SliderFloat(
+                "Animation speed", &animationSpeed,
+                0.0f, 4.0f, "%.2f", CLAMP);
+
+            ImGui::SliderFloat(
+                "Orbit radius", &orbitRadius, 0.0f, 3.0f, "%.2f", CLAMP);
+
+            ImGui::SliderFloat(
+                "Orbit height", &orbitHeight, 0.0f, 2.0f, "%.2f", CLAMP);
+
+            ImGui::SliderFloat(
+                "Orbit frequency", &orbitFrequency,
+                0.1f, 3.0f, "%.2f", CLAMP);
+
+            ImGui::SliderFloat(
+                "Rotation speed", &rotationSpeed,
+                0.0f, 180.0f, "%.1f deg/s", CLAMP);
+
+            if (ImGui::Button("Reset animation")) {
+                animationTime = 0.0;
+            }
+        }
+
+        void drawPointsUI() {
+            ImGui::Text("Count: %u", static_cast<unsigned>(points.size()));
+
+            ImGui::BeginDisabled(points.size() >= maxStorageRange / sizeof(PointGpu));
+            if (ImGui::Button("Add point light")) {
+                points.emplace_back();
+            }
+            ImGui::EndDisabled();
+
+            int removeIndex = -1;
+
+            for (size_t i = 0; i < points.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+
+                const std::string label = "Point " + std::to_string(i + 1);
+
+                if (ImGui::TreeNode(label.c_str())) {
+                    auto& light = points[i];
+
+                    ImGui::DragFloat3(
+                        "Position", glm::value_ptr(light.position), 0.05f);
+
+                    ImGui::ColorEdit3(
+                        "Color", glm::value_ptr(light.colorIntensity));
+
+                    ImGui::SliderFloat(
+                        "Intensity", &light.colorIntensity.w,
+                        0.0f, 150.0f, "%.2f", CLAMP);
+
+                    if (ImGui::Button("Delete point light")) {
+                        removeIndex = static_cast<int>(i);
+                    }
+
+                    ImGui::TreePop();
+                }
+
+                ImGui::PopID();
+            }
+
+            if (removeIndex >= 0) {
+                points.erase(points.begin() + removeIndex);
+            }
+        }
+
+        void drawSpotsUI() {
+            ImGui::Text("Count: %u", static_cast<unsigned>(spots.size()));
+
+            ImGui::BeginDisabled(spots.size() >= maxStorageRange / sizeof(SpotGpu));
+            if (ImGui::Button("Add spotlight")) {
+                spots.emplace_back();
+            }
+            ImGui::EndDisabled();
+
+            int removeIndex = -1;
+
+            for (size_t i = 0; i < spots.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+
+                const std::string label = "Spot " + std::to_string(i + 1);
+
+                if (ImGui::TreeNode(label.c_str())) {
+                    auto& light = spots[i];
+
+                    ImGui::DragFloat3(
+                        "Position", glm::value_ptr(light.gpu.position), 0.05f);
+
+                    ImGui::DragFloat3(
+                        "Direction",
+                        glm::value_ptr(light.gpu.directionCosOuter), 0.02f);
+
+                    if (ImGui::Button("Aim at first object")) {
+                        const vec3 direction =
+                            models[0].position - vec3(light.gpu.position);
+
+                        light.gpu.directionCosOuter = vec4(
+                            safeNormalize(direction), 0.0f);
+                    }
+
+                    ImGui::ColorEdit3(
+                        "Color", glm::value_ptr(light.gpu.colorIntensity));
+
+                    ImGui::SliderFloat(
+                        "Intensity", &light.gpu.colorIntensity.w,
+                        0.0f, 200.0f, "%.2f", CLAMP);
+
+                    ImGui::SliderFloat(
+                        "Inner half-angle", &light.innerAngle,
+                        0.0f, 85.0f, "%.1f deg", CLAMP);
+
+                    ImGui::SliderFloat(
+                        "Outer half-angle", &light.outerAngle,
+                        0.0f, 85.0f, "%.1f deg", CLAMP);
+
+                    light.outerAngle = std::max(
+                        light.outerAngle, light.innerAngle);
+
+                    ImGui::TextWrapped(
+                        "Angles are measured from the cone axis. "
+                        "Equal angles produce a hard edge.");
+
+                    if (ImGui::Button("Delete spotlight")) {
+                        removeIndex = static_cast<int>(i);
+                    }
+
+                    ImGui::TreePop();
+                }
+
+                ImGui::PopID();
+            }
+
+            if (removeIndex >= 0) {
+                spots.erase(spots.begin() + removeIndex);
+            }
+        }
+
+        mat4 modelMatrix(uint32_t index) {
+            const auto& model = models[index];
+
+            vec3 position = model.position;
+            vec3 rotation = model.rotation;
+
+            if (index < 2) {
+                const float phase = static_cast<float>(
+                    std::remainder(
+                        animationTime * static_cast<double>(orbitFrequency),
+                        2.0 * static_cast<double>(PI)));
+
+                const float sign = index == 0 ? 1.0f : -0.65f;
+
+                // At t = 0 the orbit offset is zero.
+                position += sign * vec3(
+                    (std::cos(phase) - 1.0f) * orbitRadius,
+                    std::sin(2.0f * phase) * orbitHeight,
+                    std::sin(phase) * orbitRadius);
+
+                const double turn = animationTime * rotationSpeed;
+
+                rotation += vec3(
+                    static_cast<float>(std::remainder(turn * sign * 0.7, 360.0)),
+                    static_cast<float>(std::remainder(turn * sign, 360.0)),
+                    static_cast<float>(std::remainder(turn * sign * 0.35, 360.0)));
+            }
+
+            mat4 result = glm::translate(mat4(1.0f), position);
+
+            result = glm::rotate(
+                result, glm::radians(rotation.z), vec3(0, 0, 1));
+            result = glm::rotate(
+                result, glm::radians(rotation.y), vec3(0, 1, 0));
+            result = glm::rotate(
+                result, glm::radians(rotation.x), vec3(1, 0, 0));
+
+            return glm::scale(result, model.scale);
+        }
+
+        void drawMesh(VkCommandBuffer command, const Mesh& mesh) {
+            const VkDeviceSize offset = 0;
+
+            vkCmdBindVertexBuffers(
+                command, 0, 1, &mesh.vertices.handle, &offset);
+
+            vkCmdDraw(command, mesh.count, 1, 0, 0);
+        }
+
+        void setPush(VkCommandBuffer command, const Push& push) {
+            vkCmdPushConstants(
+                command,
+                pipelineLayout,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                0,
+                sizeof(Push),
+                &push);
+        }
+
+        void drawMarker(
+            VkCommandBuffer command,
+            vec3 position,
+            vec3 color) {
+
+            Push push{};
+            push.flags.x = 1;
+            push.color = vec4(color, 1.0f);
+
+            push.transform = glm::scale(
+                glm::translate(mat4(1.0f), position),
+                vec3(markerSize));
+
+            setPush(command, push);
+            drawMesh(command, cubeMesh);
+        }
+
+        void drawSpotCone(
+            VkCommandBuffer command,
+            const Spot& light,
+            float angle,
+            vec3 color) {
+
+            const vec3 direction = safeNormalize(
+                vec3(light.gpu.directionCosOuter));
+
+            const vec3 reference =
+                std::abs(direction.y) < 0.95f
+                ? vec3(0, 1, 0) : vec3(1, 0, 0);
+
+            const vec3 right = safeNormalize(
+                glm::cross(direction, reference), vec3(1, 0, 0));
+
+            const vec3 up = safeNormalize(
+                glm::cross(right, direction), vec3(0, 1, 0));
+
+            mat4 orientation(1.0f);
+            orientation[0] = vec4(right, 0.0f);
+            orientation[1] = vec4(up, 0.0f);
+            orientation[2] = vec4(-direction, 0.0f);
+
+            const float radius =
+                coneLength * std::tan(glm::radians(angle));
+
+            Push push{};
+            push.flags.x = 1;
+            push.color = vec4(color, 1.0f);
+
+            push.transform =
+                glm::translate(mat4(1.0f), vec3(light.gpu.position)) *
+                orientation *
+                glm::scale(mat4(1.0f), vec3(radius, radius, coneLength));
+
+            setPush(command, push);
+            drawMesh(command, coneMesh);
+        }
+
+    } // namespace
+
+    bool initialize() {
+        try {
+            VkPhysicalDeviceProperties properties{};
+            vkGetPhysicalDeviceProperties(
+                graphics::internal::context.physical_device,
+                &properties);
+
+            maxStorageRange = properties.limits.maxStorageBufferRange;
+
+            if (properties.limits.maxPushConstantsSize < sizeof(Push)) {
+                throw std::runtime_error("Insufficient push constant size");
+            }
+
+            models[0] = Model{};
+
+            models[1] = Model{};
+            models[1].position = vec3(-3.3f, -0.3f, -0.5f);
+            models[1].scale = vec3(0.8f);
+            models[1].albedo = vec3(1.0f, 0.35f, 0.16f);
+            models[1].shininess = 32.0f;
+
+            models[2] = Model{};
+            models[2].position = vec3(0.0f, -1.9f, 0.0f);
+            models[2].scale = vec3(14.0f, 1.0f, 14.0f);
+            models[2].albedo = vec3(0.32f, 0.36f, 0.43f);
+            models[2].specular = vec3(0.25f);
+            models[2].shininess = 24.0f;
+
+            points = {
+                {
+                    vec4(-3.0f, 2.5f, 2.0f, 1.0f),
+                    vec4(1.0f, 0.25f, 0.12f, 28.0f)
+                },
+                {
+                    vec4(3.0f, 1.5f, 1.0f, 1.0f),
+                    vec4(0.15f, 0.5f, 1.0f, 25.0f)
+                }
+            };
+
+            spots = { Spot{} };
+
+            dodecahedron = createMesh(createDodecahedron());
+            floorMesh = createMesh(createFloor());
+            cubeMesh = createMesh(createCube());
+            coneMesh = createMesh(createConeLines());
+
+            sceneBuffer = createBuffer(
+                sizeof(SceneGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+            pointBuffer = createBuffer(
+                sizeof(PointGpu), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+            spotBuffer = createBuffer(
+                sizeof(SpotGpu), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+
+            for (auto& buffer : modelBuffers) {
+                buffer = createBuffer(
+                    sizeof(ModelGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+            }
+
+            createDescriptors();
+            createPipelines();
+
+            return true;
+        }
+        catch (const std::exception& error) {
+            std::cerr << "Application initialization: "
+                << error.what() << '\n';
+            shutdown();
+            return false;
+        }
+    }
+
+    void shutdown() {
+        const auto device = graphics::internal::context.device;
+
+        if (!device) {
+            return;
+        }
+
+        vkDeviceWaitIdle(device);
+
+        if (linePipeline) {
+            vkDestroyPipeline(device, linePipeline, nullptr);
+            linePipeline = VK_NULL_HANDLE;
+        }
+
+        if (trianglePipeline) {
+            vkDestroyPipeline(device, trianglePipeline, nullptr);
+            trianglePipeline = VK_NULL_HANDLE;
+        }
+
+        if (pipelineLayout) {
+            vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+            pipelineLayout = VK_NULL_HANDLE;
+        }
+
+        if (descriptorPool) {
+            vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+            descriptorPool = VK_NULL_HANDLE;
+        }
+
+        if (modelLayout) {
+            vkDestroyDescriptorSetLayout(device, modelLayout, nullptr);
+            modelLayout = VK_NULL_HANDLE;
+        }
+
+        if (sceneLayout) {
+            vkDestroyDescriptorSetLayout(device, sceneLayout, nullptr);
+            sceneLayout = VK_NULL_HANDLE;
+        }
+
+        for (auto& buffer : modelBuffers) {
+            destroyBuffer(buffer);
+        }
+
+        destroyBuffer(sceneBuffer);
+        destroyBuffer(pointBuffer);
+        destroyBuffer(spotBuffer);
+
+        destroyBuffer(dodecahedron.vertices);
+        destroyBuffer(floorMesh.vertices);
+        destroyBuffer(cubeMesh.vertices);
+        destroyBuffer(coneMesh.vertices);
+    }
+
+    void update(double time) {
+        const float deltaTime = lastTime < 0.0
+            ? 0.0f
+            : static_cast<float>(std::clamp(time - lastTime, 0.0, 0.05));
+
+        lastTime = time;
+
+        updateCameraInput(deltaTime);
+
+        ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(405, 760), ImGuiCond_FirstUseEver);
+
+        ImGui::Begin("Lab 2 - Camera and Lighting");
+
+        ImGui::Text("Variant 10: Regular Dodecahedron");
+        ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+
+        if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
+            drawCameraUI();
+        }
+
+        if (ImGui::CollapsingHeader("Objects and materials")) {
+            drawModelsUI();
+        }
+
+        if (ImGui::CollapsingHeader("Ambient and directional light")) {
+            ImGui::ColorEdit3(
+                "Ambient color", glm::value_ptr(ambientColor));
+
+            ImGui::SliderFloat(
+                "Ambient intensity", &ambientIntensity,
+                0.0f, 1.0f, "%.3f", CLAMP);
+
+            ImGui::Separator();
+
+            ImGui::Checkbox("Enable directional light", &sunEnabled);
+
+            ImGui::DragFloat3(
+                "Light direction", glm::value_ptr(sunDirection), 0.02f);
+
+            ImGui::ColorEdit3("Light color", glm::value_ptr(sunColor));
+
+            ImGui::SliderFloat(
+                "Directional intensity", &sunIntensity,
+                0.0f, 5.0f, "%.2f", CLAMP);
+
+            ImGui::TextWrapped(
+                "Direction points FROM the light. "
+                "A zero direction falls back to (0, -1, 0).");
+        }
+
+        if (ImGui::CollapsingHeader("Point lights")) {
+            drawPointsUI();
+        }
+
+        if (ImGui::CollapsingHeader("Spotlights")) {
+            drawSpotsUI();
+        }
+
+        if (ImGui::CollapsingHeader("Light visualization")) {
+            ImGui::Checkbox("Show light cubes", &showMarkers);
+            ImGui::Checkbox("Show spotlight cones", &showCones);
+
+            ImGui::SliderFloat(
+                "Cube size", &markerSize,
+                0.03f, 0.6f, "%.2f", CLAMP);
+
+            ImGui::SliderFloat(
+                "Cone display length", &coneLength,
+                0.2f, 8.0f, "%.2f", CLAMP);
+
+            ImGui::TextWrapped(
+                "White: outer cone. Gray: inner cone. "
+                "Cone length is only a visualization parameter.");
+        }
+
+        ImGui::End();
+
+        if (animateModels) {
+            animationTime += double(deltaTime) * animationSpeed;
+        }
+    }
+
+    void render(const graphics::internal::FrameData& frame) {
+        auto& context = graphics::internal::context;
+        const VkCommandBuffer command = frame.command_buffer;
+
+        vec3 forward, right, up;
+        cameraBasis(forward, right, up);
+
+        const mat4 view = glm::lookAtRH(
+            camera.position, camera.position + forward, up);
+
+        const float aspect =
+            float(context.swapchain_extent.width) /
+            float(context.swapchain_extent.height);
+
+        mat4 projection;
+
+        if (camera.perspective) {
+            projection = glm::perspectiveRH_ZO(
+                glm::radians(camera.fov),
+                aspect,
+                camera.nearPlane,
+                camera.farPlane);
+        }
+        else {
+            const float halfHeight = camera.orthoHeight * 0.5f;
+            const float halfWidth = halfHeight * aspect;
+
+            projection = glm::orthoRH_ZO(
+                -halfWidth, halfWidth,
+                -halfHeight, halfHeight,
+                camera.nearPlane, camera.farPlane);
+        }
+
+        // Vulkan viewport Y direction.
+        projection[1][1] *= -1.0f;
+
+        std::vector<SpotGpu> spotData;
+        spotData.reserve(spots.size());
+
+        for (const auto& spot : spots) {
+            SpotGpu gpu = spot.gpu;
+
+            gpu.directionCosOuter = vec4(
+                safeNormalize(vec3(spot.gpu.directionCosOuter)),
+                std::cos(glm::radians(spot.outerAngle)));
+
+            gpu.cone.x = std::cos(glm::radians(spot.innerAngle));
+            spotData.push_back(gpu);
+        }
+
+        uploadLights(pointBuffer, 1, points);
+        uploadLights(spotBuffer, 2, spotData);
+
+        SceneGpu scene{};
+        scene.viewProjection = projection * view;
+        scene.cameraPosition = vec4(camera.position, 1.0f);
+        scene.ambient = vec4(ambientColor, ambientIntensity);
+        scene.sunDirection = vec4(safeNormalize(sunDirection), 0.0f);
+        scene.sunColorIntensity = vec4(
+            sunColor, sunEnabled ? sunIntensity : 0.0f);
+
+        scene.counts = glm::uvec4(
+            static_cast<uint32_t>(points.size()),
+            static_cast<uint32_t>(spots.size()),
+            0, 0);
+
+        upload(sceneBuffer, &scene, sizeof(scene));
+
+        for (uint32_t i = 0; i < MODEL_COUNT; ++i) {
+            ModelGpu gpu{};
+            gpu.model = modelMatrix(i);
+
+            // Correct even for non-uniform object scaling.
+            gpu.normalMatrix = glm::transpose(glm::inverse(gpu.model));
+
+            gpu.albedo = vec4(models[i].albedo, 1.0f);
+            gpu.specularShininess = vec4(
+                models[i].specular, models[i].shininess);
+
+            gpu.options.x = models[i].proceduralColor ? 1.0f : 0.0f;
+
+            upload(modelBuffers[i], &gpu, sizeof(gpu));
+        }
+
+        VkViewport viewport{};
+        viewport.width = float(context.swapchain_extent.width);
+        viewport.height = float(context.swapchain_extent.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+
+        VkRect2D scissor{};
+        scissor.extent = context.swapchain_extent;
+
+        vkCmdSetViewport(command, 0, 1, &viewport);
+        vkCmdSetScissor(command, 0, 1, &scissor);
+
+        vkCmdBindPipeline(
+            command, VK_PIPELINE_BIND_POINT_GRAPHICS, trianglePipeline);
+
+        vkCmdBindDescriptorSets(
+            command,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipelineLayout,
+            0, 1, &sceneSet,
+            0, nullptr);
+
+        Push litPush{};
+        setPush(command, litPush);
+
+        for (uint32_t i = 0; i < MODEL_COUNT; ++i) {
+            if (!models[i].visible) {
+                continue;
+            }
+
+            vkCmdBindDescriptorSets(
+                command,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipelineLayout,
+                1, 1, &modelSets[i],
+                0, nullptr);
+
+            drawMesh(command, i == 2 ? floorMesh : dodecahedron);
+        }
+
+        // Keep set 1 valid even when all regular objects are hidden.
+        vkCmdBindDescriptorSets(
+            command,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipelineLayout,
+            1, 1, &modelSets[0],
+            0, nullptr);
+
+        if (showMarkers) {
+            for (const auto& light : points) {
+                drawMarker(
+                    command,
+                    vec3(light.position),
+                    vec3(light.colorIntensity));
+            }
+
+            for (const auto& light : spots) {
+                drawMarker(
+                    command,
+                    vec3(light.gpu.position),
+                    vec3(light.gpu.colorIntensity));
+            }
+        }
+
+        if (showCones) {
+            vkCmdBindPipeline(
+                command, VK_PIPELINE_BIND_POINT_GRAPHICS, linePipeline);
+
+            for (const auto& light : spots) {
+                drawSpotCone(
+                    command, light, light.outerAngle, vec3(1.0f));
+
+                if (light.innerAngle + 0.01f < light.outerAngle) {
+                    drawSpotCone(
+                        command, light, light.innerAngle, vec3(0.45f));
+                }
+            }
+        }
+
+        // The graphics module draws ImGui and ends the render pass.
+    }
 
 } // namespace application
