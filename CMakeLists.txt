@@ -150,3 +150,5 @@ endforeach()
 
 add_custom_target(shaders DEPENDS ${SHADER_BINARIES})
 add_dependencies(${PROJECT_NAME} shaders)
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE TEXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/textures")

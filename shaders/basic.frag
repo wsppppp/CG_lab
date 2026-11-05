@@ -2,7 +2,7 @@
 
 layout(location = 0) in vec3 worldPosition;
 layout(location = 1) in vec3 worldNormal;
-layout(location = 2) in vec3 proceduralColor;
+layout(location = 2) in vec2 texCoord;
 
 layout(location = 0) out vec4 outColor;
 
@@ -58,9 +58,8 @@ layout(set = 0, binding = 2, std430) readonly buffer SpotBuffer
 
 layout(push_constant) uniform PushBlock
 {
-    mat4 transform;
-    vec4 color;
     ivec4 flags;
+    vec4 params;
 } pushData;
 
 vec3 safeNormalize(vec3 value, vec3 fallback)
@@ -71,6 +70,11 @@ vec3 safeNormalize(vec3 value, vec3 fallback)
         ? value * inversesqrt(lengthSquared)
         : fallback;
 }
+
+layout(set=1, binding=1) uniform sampler2D albedoMap;
+layout(set=1, binding=2) uniform sampler2D specularMap;
+layout(set=1, binding=3) uniform sampler2D emissiveMap;
+vec3 sampledSpecular;
 
 vec3 blinnPhong(
     vec3 normal,
@@ -98,7 +102,7 @@ vec3 blinnPhong(
     vec3 diffuse = albedo * nDotL;
 
     vec3 specular =
-        object.specularShininess.rgb * specularFactor;
+        object.specularShininess.rgb * sampledSpecular * specularFactor;
 
     return (diffuse + specular) * radiance;
 }
@@ -106,9 +110,9 @@ vec3 blinnPhong(
 void main()
 {
     // Light visualization bypasses the illumination model entirely.
-    if (pushData.flags.x != 0)
+    if (object.options.x > 0.5)
     {
-        outColor = vec4(pushData.color.rgb, 1.0);
+        outColor = vec4(object.albedo.rgb, 1.0);
         return;
     }
 
@@ -119,12 +123,22 @@ void main()
         scene.cameraPosition.xyz - worldPosition,
         normal);
 
-    vec3 albedo = object.albedo.rgb;
-
-    if (object.options.x > 0.5)
-    {
-        albedo *= proceduralColor;
+    vec2 uv = texCoord * pushData.params.y;
+    vec3 albedoSample = texture(albedoMap, uv).rgb;
+    sampledSpecular = texture(specularMap, uv).rgb;
+    vec3 emission = texture(emissiveMap, uv).rgb;
+    if (pushData.flags.x != 0) {
+        float t = pushData.params.x;
+        float strength = pushData.params.z;
+        vec2 uvA = uv + vec2(0.08, 0.03) * t;
+        vec2 uvB = uv * 1.6 + vec2(-0.04, 0.07) * t;
+        uvB += 0.04 * sin(uv.yx * 6.2831853 + t);
+        vec3 a = texture(albedoMap, uvA).rgb;
+        vec3 b = texture(albedoMap, uvB).rgb;
+        vec3 modulation = 0.65 + 0.35 * sin(vec3(0.0, 2.1, 4.2) + t);
+        albedoSample = mix(albedoSample, mix(a,b,0.5)*modulation, strength);
     }
+    vec3 albedo = object.albedo.rgb * albedoSample;
 
     vec3 result =
         albedo * scene.ambient.rgb * scene.ambient.w;
@@ -225,5 +239,5 @@ void main()
 
     // Lighting is computed in linear space.
     // The sRGB swapchain performs the output conversion.
-    outColor = vec4(max(result, vec3(0.0)), 1.0);
+    outColor = vec4(max(result + emission * object.options.y, vec3(0.0)), 1.0);
 }

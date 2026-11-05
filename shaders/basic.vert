@@ -2,10 +2,11 @@
 
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aUV;
 
 layout(location = 0) out vec3 worldPosition;
 layout(location = 1) out vec3 worldNormal;
-layout(location = 2) out vec3 proceduralColor;
+layout(location = 2) out vec2 texCoord;
 
 layout(set = 0, binding = 0, std140) uniform SceneBlock
 {
@@ -28,9 +29,8 @@ layout(set = 1, binding = 0, std140) uniform ModelBlock
 
 layout(push_constant) uniform PushBlock
 {
-    mat4 transform;
-    vec4 color;
     ivec4 flags;
+    vec4 params;
 } pushData;
 
 vec3 safeNormalize(vec3 value, vec3 fallback)
@@ -44,23 +44,9 @@ vec3 safeNormalize(vec3 value, vec3 fallback)
 
 void main()
 {
-    bool unlit = pushData.flags.x != 0;
-
-    mat4 transform = unlit
-        ? pushData.transform
-        : object.model;
-
-    vec4 world = transform * vec4(aPosition, 1.0);
-
+    vec4 world = object.model * vec4(aPosition, 1.0);
     worldPosition = world.xyz;
-
-    worldNormal = unlit
-        ? vec3(0.0, 1.0, 0.0)
-        : mat3(object.normalMatrix) * aNormal;
-
-    // The original lab's position-dependent vertex colors.
-    proceduralColor =
-        safeNormalize(aPosition, vec3(0.0, 1.0, 0.0)) * 0.5 + 0.5;
-
+    worldNormal = mat3(object.normalMatrix) * aNormal;
+    texCoord = aUV;
     gl_Position = scene.viewProjection * world;
 }

@@ -1,4 +1,4 @@
-﻿#include "application.hpp"
+#include "application.hpp"
 
 #include <imgui.h>
 
@@ -18,6 +18,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <filesystem>
+#include <functional>
+#include <limits>
+#define STB_IMAGE_IMPLEMENTATION
+#include "../third_party/stb_image.h"
 
 namespace application {
     namespace {
@@ -34,6 +39,7 @@ namespace application {
         struct Vertex {
             vec3 position;
             vec3 normal;
+            glm::vec2 uv{};
         };
 
         struct Buffer {
@@ -45,6 +51,7 @@ namespace application {
 
         struct Mesh {
             Buffer vertices;
+            Buffer indices;
             uint32_t count = 0;
         };
 
@@ -85,34 +92,38 @@ namespace application {
         };
 
         struct alignas(16) Push {
-            mat4 transform{ 1.0f };
-            vec4 color{ 1.0f };
             glm::ivec4 flags{};
+            vec4 params{};
         };
 
-        static_assert(sizeof(Vertex) == 24);
+        static_assert(sizeof(Vertex) == 32);
         static_assert(sizeof(SceneGpu) == 144);
         static_assert(sizeof(ModelGpu) == 176);
         static_assert(sizeof(PointGpu) == 32);
         static_assert(sizeof(SpotGpu) == 64);
-        static_assert(sizeof(Push) == 96);
+        static_assert(sizeof(Push) == 32);
 
         static_assert(offsetof(SceneGpu, cameraPosition) == 64);
         static_assert(offsetof(SceneGpu, counts) == 128);
         static_assert(offsetof(ModelGpu, albedo) == 128);
         static_assert(offsetof(ModelGpu, options) == 160);
-        static_assert(offsetof(Push, flags) == 80);
+        static_assert(offsetof(Push, flags) == 0);
 
         struct Model {
             vec3 position{ 0.0f };
             vec3 rotation{ 0.0f };
             vec3 scale{ 1.0f };
 
-            vec3 albedo{ 0.2f, 0.65f, 1.0f };
+            vec3 albedo{ 1.0f };
             vec3 specular{ 0.8f };
             float shininess = 64.0f;
 
-            bool proceduralColor = false;
+            int material = 0;
+            bool effect = false;
+            float uvScale = 1.0f;
+            float effectSpeed = 1.0f;
+            float effectStrength = 0.6f;
+            float emission = 1.0f;
             bool visible = true;
         };
 
@@ -168,14 +179,18 @@ namespace application {
         Buffer sceneBuffer;
         Buffer pointBuffer;
         Buffer spotBuffer;
-        std::array<Buffer, MODEL_COUNT> modelBuffers;
+        Buffer modelBuffer;
+        VkDeviceSize modelStride = 0;
+        uint32_t drawSlot = MODEL_COUNT;
+        float textureTime = 0;
+        bool animateTextures = true;
 
         VkDescriptorSetLayout sceneLayout = VK_NULL_HANDLE;
         VkDescriptorSetLayout modelLayout = VK_NULL_HANDLE;
         VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
 
         VkDescriptorSet sceneSet = VK_NULL_HANDLE;
-        std::array<VkDescriptorSet, MODEL_COUNT> modelSets{};
+        std::vector<VkDescriptorSet> materialSets;
 
         VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
         VkPipeline trianglePipeline = VK_NULL_HANDLE;
@@ -268,27 +283,7 @@ namespace application {
                 "vmaFlushAllocation");
         }
 
-        Mesh createMesh(const std::vector<Vertex>& vertices) {
-            Mesh mesh{};
-            mesh.count = static_cast<uint32_t>(vertices.size());
-
-            mesh.vertices = createBuffer(
-                vertices.size() * sizeof(Vertex),
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-
-            try {
-                upload(
-                    mesh.vertices, vertices.data(),
-                    vertices.size() * sizeof(Vertex));
-            }
-            catch (...) {
-                destroyBuffer(mesh.vertices);
-                throw;
-            }
-
-            return mesh;
-        }
-
+#include "texture_support.inl"
         std::vector<Vertex> createDodecahedron() {
             constexpr float phi = 1.6180339887498948482f;
             constexpr float invPhi = 0.6180339887498948482f;
@@ -452,104 +447,7 @@ namespace application {
                 1, &write, 0, nullptr);
         }
 
-        void createDescriptors() {
-            const auto device = graphics::internal::context.device;
-
-            VkDescriptorSetLayoutBinding sceneBindings[3]{};
-
-            sceneBindings[0].binding = 0;
-            sceneBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            sceneBindings[0].descriptorCount = 1;
-            sceneBindings[0].stageFlags =
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-
-            for (uint32_t i = 1; i <= 2; ++i) {
-                sceneBindings[i].binding = i;
-                sceneBindings[i].descriptorType =
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                sceneBindings[i].descriptorCount = 1;
-                sceneBindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-            }
-
-            VkDescriptorSetLayoutCreateInfo layoutInfo{
-                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
-            };
-
-            layoutInfo.bindingCount = 3;
-            layoutInfo.pBindings = sceneBindings;
-
-            check(vkCreateDescriptorSetLayout(
-                device, &layoutInfo, nullptr, &sceneLayout),
-                "vkCreateDescriptorSetLayout(scene)");
-
-            VkDescriptorSetLayoutBinding modelBinding{};
-            modelBinding.binding = 0;
-            modelBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            modelBinding.descriptorCount = 1;
-            modelBinding.stageFlags =
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-
-            layoutInfo.bindingCount = 1;
-            layoutInfo.pBindings = &modelBinding;
-
-            check(vkCreateDescriptorSetLayout(
-                device, &layoutInfo, nullptr, &modelLayout),
-                "vkCreateDescriptorSetLayout(model)");
-
-            const VkDescriptorPoolSize sizes[] = {
-                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MODEL_COUNT + 1},
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}
-            };
-
-            VkDescriptorPoolCreateInfo poolInfo{
-                VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
-            };
-
-            poolInfo.maxSets = MODEL_COUNT + 1;
-            poolInfo.poolSizeCount = 2;
-            poolInfo.pPoolSizes = sizes;
-
-            check(vkCreateDescriptorPool(
-                device, &poolInfo, nullptr, &descriptorPool),
-                "vkCreateDescriptorPool");
-
-            VkDescriptorSetAllocateInfo allocationInfo{
-                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
-            };
-
-            allocationInfo.descriptorPool = descriptorPool;
-            allocationInfo.descriptorSetCount = 1;
-            allocationInfo.pSetLayouts = &sceneLayout;
-
-            check(vkAllocateDescriptorSets(
-                device, &allocationInfo, &sceneSet),
-                "vkAllocateDescriptorSets(scene)");
-
-            std::array<VkDescriptorSetLayout, MODEL_COUNT> layouts{};
-            layouts.fill(modelLayout);
-
-            allocationInfo.descriptorSetCount = MODEL_COUNT;
-            allocationInfo.pSetLayouts = layouts.data();
-
-            check(vkAllocateDescriptorSets(
-                device, &allocationInfo, modelSets.data()),
-                "vkAllocateDescriptorSets(models)");
-
-            writeDescriptor(
-                sceneSet, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sceneBuffer);
-            writeDescriptor(
-                sceneSet, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, pointBuffer);
-            writeDescriptor(
-                sceneSet, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, spotBuffer);
-
-            for (uint32_t i = 0; i < MODEL_COUNT; ++i) {
-                writeDescriptor(
-                    modelSets[i], 0,
-                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                    modelBuffers[i]);
-            }
-        }
-
+#include "material_descriptors.inl"
         template<class T>
         void uploadLights(
             Buffer& buffer,
@@ -659,7 +557,8 @@ namespace application {
                 {
                     1, 0, VK_FORMAT_R32G32B32_SFLOAT,
                     static_cast<uint32_t>(offsetof(Vertex, normal))
-                }
+                },
+                {2, 0, VK_FORMAT_R32G32_SFLOAT, static_cast<uint32_t>(offsetof(Vertex, uv))}
             };
 
             VkPipelineVertexInputStateCreateInfo vertexInput{
@@ -668,7 +567,7 @@ namespace application {
 
             vertexInput.vertexBindingDescriptionCount = 1;
             vertexInput.pVertexBindingDescriptions = &binding;
-            vertexInput.vertexAttributeDescriptionCount = 2;
+            vertexInput.vertexAttributeDescriptionCount = 3;
             vertexInput.pVertexAttributeDescriptions = attributes;
 
             VkPipelineInputAssemblyStateCreateInfo assembly{
@@ -953,8 +852,17 @@ namespace application {
                         "Shininess", &model.shininess,
                         1.0f, 256.0f, "%.1f", CLAMP);
 
-                    ImGui::Checkbox(
-                        "Procedural vertex colors", &model.proceduralColor);
+                if (ImGui::BeginCombo("Texture material", materials[model.material].name.c_str())) {
+                    for (int m=0; m<int(materials.size()); ++m) {
+                        if (ImGui::Selectable(materials[m].name.c_str(), model.material==m)) model.material=m;
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::SliderFloat("UV tiling", &model.uvScale, 0.1f, 12.0f, "%.2f", CLAMP);
+                ImGui::Checkbox("Animated double sampling", &model.effect);
+                ImGui::SliderFloat("Effect speed", &model.effectSpeed, 0.0f, 3.0f, "%.2f", CLAMP);
+                ImGui::SliderFloat("Effect strength", &model.effectStrength, 0.0f, 1.0f, "%.2f", CLAMP);
+                ImGui::SliderFloat("Emission strength", &model.emission, 0.0f, 5.0f, "%.2f", CLAMP);
 
                     ImGui::TreePop();
                 }
@@ -1150,7 +1058,8 @@ namespace application {
             vkCmdBindVertexBuffers(
                 command, 0, 1, &mesh.vertices.handle, &offset);
 
-            vkCmdDraw(command, mesh.count, 1, 0, 0);
+            vkCmdBindIndexBuffer(command, mesh.indices.handle, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(command, mesh.count, 1, 0, 0, 0);
         }
 
         void setPush(VkCommandBuffer command, const Push& push) {
@@ -1168,15 +1077,17 @@ namespace application {
             vec3 position,
             vec3 color) {
 
-            Push push{};
-            push.flags.x = 1;
-            push.color = vec4(color, 1.0f);
+            ModelGpu marker{};
+            marker.options.x = 1;
+            marker.albedo = vec4(color, 1.0f);
 
-            push.transform = glm::scale(
+            marker.model = glm::scale(
                 glm::translate(mat4(1.0f), position),
                 vec3(markerSize));
 
-            setPush(command, push);
+            writeModel(drawSlot, marker);
+            bindMaterial(command, 0, drawSlot++);
+            setPush(command, Push{});
             drawMesh(command, cubeMesh);
         }
 
@@ -1207,16 +1118,18 @@ namespace application {
             const float radius =
                 coneLength * std::tan(glm::radians(angle));
 
-            Push push{};
-            push.flags.x = 1;
-            push.color = vec4(color, 1.0f);
+            ModelGpu marker{};
+            marker.options.x = 1;
+            marker.albedo = vec4(color, 1.0f);
 
-            push.transform =
+            marker.model =
                 glm::translate(mat4(1.0f), vec3(light.gpu.position)) *
                 orientation *
                 glm::scale(mat4(1.0f), vec3(radius, radius, coneLength));
 
-            setPush(command, push);
+            writeModel(drawSlot, marker);
+            bindMaterial(command, 0, drawSlot++);
+            setPush(command, Push{});
             drawMesh(command, coneMesh);
         }
 
@@ -1277,11 +1190,15 @@ namespace application {
             spotBuffer = createBuffer(
                 sizeof(SpotGpu), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
-            for (auto& buffer : modelBuffers) {
-                buffer = createBuffer(
-                    sizeof(ModelGpu), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-            }
-
+            const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
+            modelStride = (sizeof(ModelGpu) + alignment - 1) / alignment * alignment;
+            modelBuffer = createBuffer(modelStride * 32, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+            loadMaterials();
+            models[0].albedo = models[1].albedo = models[2].albedo = vec3(1);
+            models[0].material = 1;
+            models[1].material = 2;
+            models[1].effect = true;
+            models[2].uvScale = 5.0f;
             createDescriptors();
             createPipelines();
 
@@ -1334,18 +1251,21 @@ namespace application {
             sceneLayout = VK_NULL_HANDLE;
         }
 
-        for (auto& buffer : modelBuffers) {
-            destroyBuffer(buffer);
-        }
+        destroyBuffer(modelBuffer);
+        destroyTextures();
 
         destroyBuffer(sceneBuffer);
         destroyBuffer(pointBuffer);
         destroyBuffer(spotBuffer);
 
         destroyBuffer(dodecahedron.vertices);
+        destroyBuffer(dodecahedron.indices);
         destroyBuffer(floorMesh.vertices);
+        destroyBuffer(floorMesh.indices);
         destroyBuffer(cubeMesh.vertices);
+        destroyBuffer(cubeMesh.indices);
         destroyBuffer(coneMesh.vertices);
+        destroyBuffer(coneMesh.indices);
     }
 
     void update(double time) {
@@ -1356,13 +1276,25 @@ namespace application {
         lastTime = time;
 
         updateCameraInput(deltaTime);
+        if (animateTextures) textureTime += deltaTime;
 
         ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(405, 760), ImGuiCond_FirstUseEver);
 
-        ImGui::Begin("Lab 2 - Camera and Lighting");
+        ImGui::Begin("Lab 3 - Texture Mapping");
 
-        ImGui::Text("Variant 10: Regular Dodecahedron");
+        ImGui::Text("Lab 3: Texture mapping / Variant 10");
+        ImGui::Checkbox("Animate texture effects", &animateTextures);
+        if (ImGui::Button("All lights OFF (emissive test)")) {
+            sunEnabled=false; ambientIntensity=0;
+            for (auto& p: points) p.colorIntensity.w=0;
+            for (auto& p: spots) p.gpu.colorIntensity.w=0;
+        }
+        if (ImGui::Button("Restore lighting")) {
+            sunEnabled=true; sunIntensity=0.7f; ambientIntensity=0.08f;
+            for (auto& p: points) p.colorIntensity.w=25;
+            for (auto& p: spots) p.gpu.colorIntensity.w=60;
+        }
         ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
 
         if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1434,6 +1366,8 @@ namespace application {
     void render(const graphics::internal::FrameData& frame) {
         auto& context = graphics::internal::context;
         const VkCommandBuffer command = frame.command_buffer;
+        ensureModelCapacity(MODEL_COUNT + points.size() + 3 * spots.size());
+        drawSlot = MODEL_COUNT;
 
         vec3 forward, right, up;
         cameraBasis(forward, right, up);
@@ -1510,9 +1444,9 @@ namespace application {
             gpu.specularShininess = vec4(
                 models[i].specular, models[i].shininess);
 
-            gpu.options.x = models[i].proceduralColor ? 1.0f : 0.0f;
+            gpu.options = vec4(0.0f, models[i].emission, 0.0f, 0.0f);
 
-            upload(modelBuffers[i], &gpu, sizeof(gpu));
+            writeModel(i, gpu);
         }
 
         VkViewport viewport{};
@@ -1545,23 +1479,15 @@ namespace application {
                 continue;
             }
 
-            vkCmdBindDescriptorSets(
-                command,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipelineLayout,
-                1, 1, &modelSets[i],
-                0, nullptr);
+            bindMaterial(command, models[i].material, i);
+            Push effect{};
+            effect.flags.x = models[i].effect ? 1 : 0;
+            effect.params = vec4(textureTime * models[i].effectSpeed, models[i].uvScale,
+                                 models[i].effectStrength, 0.0f);
+            setPush(command, effect);
 
             drawMesh(command, i == 2 ? floorMesh : dodecahedron);
         }
-
-        // Keep set 1 valid even when all regular objects are hidden.
-        vkCmdBindDescriptorSets(
-            command,
-            VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipelineLayout,
-            1, 1, &modelSets[0],
-            0, nullptr);
 
         if (showMarkers) {
             for (const auto& light : points) {
